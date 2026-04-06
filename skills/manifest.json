@@ -32,6 +32,11 @@
       "name": "migrate",
       "path": "migrate/SKILL.md",
       "description": "Universal migration from Obsidian, Notion, Logseq, markdown, CSV, JSON, Roam"
+    },
+    {
+      "name": "install",
+      "path": "install/SKILL.md",
+      "description": "Set up GBrain from scratch: Supabase, import, sync, file migration"
     }
   ],
   "dependencies": {
