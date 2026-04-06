@@ -185,7 +185,12 @@ Every error tells you what happened, why, and how to fix it:
 
 ## Upgrading
 
-- Run `bun update gbrain` to get the latest version
+Upgrade depends on how you installed:
+- **bun (standalone or library):** `bun update gbrain`
+- **ClawHub:** `clawhub update gbrain`
+- **Compiled binary:** Download the latest from [GitHub Releases](https://github.com/garrytan/gbrain/releases)
+
+After upgrading:
 - Run `gbrain init` again to apply schema migrations (idempotent, safe to re-run)
 - The new `files` table gets created automatically on next init
 - Sync state is preserved across upgrades

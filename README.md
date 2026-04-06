@@ -117,12 +117,12 @@ GBrain keeps your brain current automatically. After setup, `gbrain sync --watch
 clawhub install gbrain
 ```
 
-This installs the npm package, copies the skill files, and runs `gbrain init --supabase` on first use.
+This installs the package, copies the skill files, and runs `gbrain init --supabase` on first use.
 
 ### Standalone CLI
 
 ```bash
-npm install -g gbrain
+bun add -g gbrain
 ```
 
 ### As a library
@@ -136,6 +136,23 @@ import { PostgresEngine } from 'gbrain';
 ```
 
 All paths require a Postgres database with pgvector. Supabase Pro ($25/mo) is the recommended zero-ops option.
+
+## Upgrade
+
+Upgrade depends on how you installed:
+
+```bash
+# Installed via bun (standalone or library)
+bun update gbrain
+
+# Installed via ClawHub
+clawhub update gbrain
+
+# Compiled binary
+# Download the latest from https://github.com/garrytan/gbrain/releases
+```
+
+After upgrading, run `gbrain init` again to apply any schema migrations (idempotent, safe to re-run).
 
 ## Setup
 
