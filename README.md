@@ -221,6 +221,14 @@ knowledge brain.
    with the production agent patterns: brain-agent loop,
    entity detection, source attribution, iron law back-linking,
    and the enrichment pipeline
+
+7. Set up daily GBrain update checks. Run `gbrain check-update`
+   to verify it works, then register a daily cron that checks
+   for new versions and messages me when there's something
+   worth upgrading to. I'll always be asked before anything
+   is installed — just let me know when updates are available.
+   Only notify me for meaningful updates (new features),
+   not small patches.
 ```
 
 OpenClaw will install gbrain, walk through Supabase setup, discover your markdown files, import them, and prove search works with a query from your data.

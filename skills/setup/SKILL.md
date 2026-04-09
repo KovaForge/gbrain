@@ -208,10 +208,39 @@ output. It checks connection, pgvector, RLS, schema version, and embeddings.
 | No pages found | Query before import | Import files into gbrain first |
 | RLS not enabled | Security gap | Run `gbrain init` again (auto-enables RLS) |
 
+## Phase G: Auto-Update Check (if not already configured)
+
+If the user's install did NOT include setting up auto-update checks (e.g., they
+used the manual install path or an older version of the OpenClaw paste), offer it:
+
+> "Would you like daily GBrain update checks? I'll let you know when there's a
+> new version worth upgrading to — including new skills and schema recommendations.
+> You'll always be asked before anything is installed."
+
+If they agree:
+1. Test: `gbrain check-update --json`
+2. Register daily cron (see GBRAIN_SKILLPACK.md Section 17)
+
+If already configured or user declines, skip.
+
+## Schema State Tracking
+
+After presenting the recommended directories (Phase C/E) and the user selects which
+ones to create, write `~/.gbrain/update-state.json` recording:
+- `schema_version_applied`: current gbrain version
+- `skillpack_version_applied`: current gbrain version
+- `schema_choices.adopted`: directories the user created
+- `schema_choices.declined`: directories the user explicitly skipped
+- `schema_choices.custom`: directories the user added that aren't in the recommended schema
+
+This file enables future upgrades to suggest new schema additions without
+re-suggesting things the user already declined.
+
 ## Tools Used
 
 - `gbrain init --non-interactive --url ...` -- create brain
 - `gbrain import <dir> --no-embed [--workers N]` -- import files
 - `gbrain search <query>` -- search brain
 - `gbrain doctor --json` -- health check
+- `gbrain check-update --json` -- check for updates
 - `gbrain embed refresh` -- generate embeddings
