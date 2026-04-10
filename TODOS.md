@@ -17,17 +17,37 @@
 
 **Depends on:** Part 5 (parallel import with per-worker engines) -- already shipped.
 
+## P0
+
+### ChatGPT MCP support (OAuth 2.1)
+**What:** Add OAuth 2.1 with Dynamic Client Registration to the Edge Function so ChatGPT can connect.
+
+**Why:** ChatGPT requires OAuth 2.1 for MCP connectors. Bearer token auth is NOT supported. This is the only major AI client that can't use GBrain remotely.
+
+**Pros:** Completes the "every AI client" promise. ChatGPT has the largest user base.
+
+**Cons:** OAuth 2.1 is a significant implementation: authorization endpoint, token endpoint, PKCE flow, dynamic client registration. Estimated CC: ~3-4 hours.
+
+**Context:** Discovered during DX review (2026-04-10). All other clients (Claude Desktop/Code/Cowork, Perplexity) work with bearer tokens. See `docs/mcp/CHATGPT.md` for current status.
+
+**Depends on:** v0.6.0 remote MCP server (shipped).
+
 ## P2
 
+### Fly.io HTTP server as alternative deployment
+**What:** Add `gbrain serve --http` and a Dockerfile/fly.toml for users who prefer a traditional server over Edge Functions.
+
+**Why:** Avoids the Deno bundling seam. Bun runs natively. No 60s timeout. No cold start. Codex flagged the bundle strategy as "permanent maintenance tax."
+
+**Pros:** Simpler code path, no edge-entry.ts needed, no Deno compat concerns. Supports sync_brain and file_upload remotely.
+
+**Cons:** Users need a Fly.io account. Not zero-infra.
+
+**Context:** From CEO review (2026-04-10). Edge Functions are the primary path. Fly.io is for power users who want full operation support remotely.
+
+**Depends on:** v0.6.0 remote MCP server (shipped).
+
+## Completed
+
 ### Implement AWS Signature V4 for S3 storage backend
-**What:** Replace the unsigned `signedFetch()` in `src/core/storage/s3.ts` with proper AWS Signature V4 request signing.
-
-**Why:** The current S3 implementation accepts `accessKeyId` and `secretAccessKey` but never signs requests. It only works with public buckets or pre-signed URLs. Private S3 buckets return 403.
-
-**Pros:** Enables private S3/R2/MinIO bucket support. Users can store files securely without relying on public bucket access.
-
-**Cons:** AWS Sig V4 is complex (canonical request, string to sign, signing key derivation). Could use a lightweight library instead of rolling from scratch. Medium implementation effort.
-
-**Context:** Identified during CSO security audit (2026-04-10). The code explicitly comments this as "simplified" and not production-ready. Nobody uses S3 storage today (Supabase Storage is the default). Only implement when S3 becomes a real deployment path.
-
-**Depends on:** Nothing. Self-contained change to `src/core/storage/s3.ts`.
+**Completed:** v0.6.0 (2026-04-10) — replaced with @aws-sdk/client-s3 for proper SigV4 signing.

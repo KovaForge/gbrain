@@ -2,6 +2,37 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.6.0] - 2026-04-10
+
+### Added
+
+- **Access your brain from any AI client.** Deploy GBrain as a serverless remote MCP endpoint on your existing Supabase instance. Works with Claude Desktop, Claude Code, Cowork, and Perplexity Computer. One URL, bearer token auth, zero new infrastructure. Clone the repo, fill in 3 env vars, run `scripts/deploy-remote.sh`, done.
+- **Per-client setup guides** in `docs/mcp/` for Claude Code, Claude Desktop, Cowork, Perplexity, and ChatGPT (coming soon, requires OAuth 2.1). Also documents Tailscale Funnel and ngrok as self-hosted alternatives.
+- **Token management** via standalone `src/commands/auth.ts`. Create, list, revoke per-client bearer tokens. Includes smoke test: `auth.ts test <url> --token <token>` verifies the full pipeline (initialize + tools/list + get_stats) in 3 seconds.
+- **Usage logging** via `mcp_request_log` table. Every remote tool call logs token name, operation, latency, and status for debugging and security auditing.
+- **Hardened health endpoint** at `/health`. Unauthenticated: 200/503 only (no info disclosure). Authenticated: checks postgres, pgvector, and OpenAI API key status.
+
+### Fixed
+
+- **MCP server actually connects now.** Handler registration used string literals (`'tools/list' as any`) instead of SDK typed schemas. Replaced with `ListToolsRequestSchema` and `CallToolRequestSchema`. Without this fix, `gbrain serve` silently failed to register handlers. (Issue #9)
+- **Search results no longer flooded by one large page.** Keyword search returned ALL chunks from matching pages. Now returns one best chunk per page via `DISTINCT ON`. (Issue #22)
+- **Search dedup no longer collapses to one chunk per page.** Layer 1 kept only the single highest-scoring chunk per slug. Now keeps top 3, letting later dedup layers (text similarity, cap per page) do their job. (Issue #22)
+- **Transactions no longer corrupt shared state.** Both `PostgresEngine.transaction()` and `db.withTransaction()` swapped the shared connection reference, breaking under concurrent use. Now uses scoped engine via `Object.create` with no shared state mutation. (Issue #22)
+- **embed --stale no longer wipes valid embeddings.** `upsertChunks()` deleted all chunks then re-inserted, writing NULL for chunks without new embeddings. Now uses UPSERT (INSERT ON CONFLICT UPDATE) with COALESCE to preserve existing embeddings. (Issue #22)
+- **Slug normalization is consistent.** `pathToSlug()` preserved case while `inferSlug()` lowercased. Now `validateSlug()` enforces lowercase at the validation layer, covering all entry points. (Issue #22)
+- **initSchema no longer reads from disk at runtime.** Both schema loaders used `readFileSync` with `import.meta.url`, which broke in compiled binaries and Deno Edge Functions. Schema is now embedded at build time via `scripts/build-schema.sh`. (Issue #22)
+- **file_upload actually uploads content.** The operation wrote DB metadata but never called the storage backend. Fixed in all 3 paths (operation, CLI upload, CLI sync) with rollback semantics. (Issue #22)
+- **S3 storage backend authenticates requests.** `signedFetch()` was just unsigned `fetch()`. Replaced with `@aws-sdk/client-s3` for proper SigV4 signing. Supports R2/MinIO via `forcePathStyle`. (Issue #22)
+- **Parallel import uses thread-safe queue.** `queue.shift()` had race conditions under parallel workers. Now uses an atomic index counter. Checkpoint preserved on errors for safe resume. (Issue #22)
+- **redirect verifies remote existence before deleting local files.** Previously deleted local files unconditionally. Now checks storage backend before removing. (Issue #22)
+- **`gbrain call` respects dry_run.** `handleToolCall()` hardcoded `dryRun: false`. Now reads from params. (Issue #22)
+
+### Changed
+
+- Added `@aws-sdk/client-s3` as a dependency for authenticated S3 operations.
+- Schema migration v2: unique index on `content_chunks(page_id, chunk_index)` for UPSERT support.
+- Schema migration v3: `access_tokens` and `mcp_request_log` tables for remote MCP auth.
+
 ## [0.5.0] - 2026-04-10
 
 ### Added
