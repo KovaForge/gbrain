@@ -36,16 +36,16 @@ export async function hybridSearch(
     }
   }
 
-  // Embed all query variants
-  const embeddings = await Promise.all(queries.map(q => embed(q)));
+  // Run keyword search concurrently with embed+vector pipeline
+  const [keywordResults, embeddings] = await Promise.all([
+    engine.searchKeyword(query, { limit: limit * 2 }),
+    Promise.all(queries.map(q => embed(q))),
+  ]);
 
   // Run vector search for each embedding
   const vectorLists = await Promise.all(
     embeddings.map(emb => engine.searchVector(emb, { limit: limit * 2 })),
   );
-
-  // Run keyword search (only the original query)
-  const keywordResults = await engine.searchKeyword(query, { limit: limit * 2 });
 
   // Merge all result lists via RRF
   const allLists = [...vectorLists, keywordResults];

@@ -57,15 +57,21 @@ export async function runInit(args: string[]) {
     throw e;
   }
 
-  // Check pgvector extension
+  // Check and auto-create pgvector extension
   try {
     const conn = (engine as any).sql || (await import('../core/db.ts')).getConnection();
     const ext = await conn`SELECT extname FROM pg_extension WHERE extname = 'vector'`;
     if (ext.length === 0) {
-      console.error('pgvector extension not found. Run in Supabase SQL Editor:');
-      console.error('  CREATE EXTENSION vector;');
-      await engine.disconnect();
-      process.exit(1);
+      console.log('pgvector extension not found. Attempting to create...');
+      try {
+        await conn`CREATE EXTENSION IF NOT EXISTS vector`;
+        console.log('pgvector extension created successfully.');
+      } catch {
+        console.error('Could not auto-create pgvector extension. Run manually in SQL Editor:');
+        console.error('  CREATE EXTENSION vector;');
+        await engine.disconnect();
+        process.exit(1);
+      }
     }
   } catch {
     // Non-fatal: proceed without pgvector check if query fails
@@ -111,8 +117,7 @@ async function supabaseWizard(): Promise<string> {
   // Fallback to manual URL
   console.log('\nEnter your Supabase/Postgres connection URL:');
   console.log('  Format: postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres');
-  console.log('  Find it: Supabase Dashboard > gear icon (Project Settings) > Database >');
-  console.log('           Connection string > URI tab > change dropdown to "Session pooler"\n');
+  console.log('  Find it: Supabase Dashboard > Connect (top bar) > Connection String > Session Pooler\n');
 
   const url = await readLine('Connection URL: ');
   if (!url) {
@@ -129,6 +134,7 @@ function readLine(prompt: string): Promise<string> {
     process.stdin.setEncoding('utf-8');
     process.stdin.once('data', (chunk) => {
       data = chunk.toString().trim();
+      process.stdin.pause();
       resolve(data);
     });
     process.stdin.resume();
