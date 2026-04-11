@@ -28,6 +28,13 @@ server are both generated from this single source. Skills are fat markdown files
 - `src/commands/auth.ts` — Standalone token management (create/list/revoke/test)
 - `src/core/schema-embedded.ts` — AUTO-GENERATED from schema.sql (run `bun run build:schema`)
 - `src/schema.sql` — Full Postgres + pgvector DDL (source of truth, generates schema-embedded.ts)
+- `src/commands/integrations.ts` — Standalone integration recipe management (no DB needed)
+- `recipes/` — Integration recipe files (YAML frontmatter + markdown setup instructions)
+- `docs/guides/` — Individual SKILLPACK guides (broken out from monolith)
+- `docs/integrations/` — "Getting Data In" guides and integration docs
+- `docs/architecture/infra-layer.md` — Shared infrastructure documentation
+- `docs/ethos/THIN_HARNESS_FAT_SKILLS.md` — Architecture philosophy essay
+- `docs/designs/HOMEBREW_FOR_PERSONAL_AI.md` — 10-star vision for integration system
 - `scripts/deploy-remote.sh` — One-script remote MCP deployment
 - `docs/mcp/` — Per-client setup guides (Claude Desktop, Code, Cowork, Perplexity, ChatGPT)
 - `openclaw.plugin.json` — ClawHub bundle plugin manifest
@@ -50,7 +57,8 @@ parity), `test/cli.test.ts` (CLI structure), `test/config.test.ts` (config redac
 `test/import-resume.test.ts` (import checkpoints), `test/migrate.test.ts` (migration),
 `test/setup-branching.test.ts` (setup flow), `test/slug-validation.test.ts` (slug validation),
 `test/storage.test.ts` (storage backends), `test/supabase-admin.test.ts` (Supabase admin),
-`test/yaml-lite.test.ts` (YAML parsing), `test/check-update.test.ts` (version check + update CLI).
+`test/yaml-lite.test.ts` (YAML parsing), `test/check-update.test.ts` (version check + update CLI),
+`test/integrations.test.ts` (recipe parsing, CLI routing, recipe validation).
 
 E2E tests (`test/e2e/`): Run against real Postgres+pgvector. Require `DATABASE_URL`.
 - `bun run test:e2e` runs Tier 1 (mechanical, all operations, no API keys)

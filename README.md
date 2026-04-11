@@ -14,6 +14,7 @@ I was setting up my [OpenClaw](https://openclaw.com) agent and started a markdow
 - **300+ captured original ideas** organized by thesis
 - **500+ media pages** (video transcripts, books, articles)
 - Company profiles, food guides, travel logs
+- **Voice calls** that automatically create brain pages (Twilio + OpenAI Realtime)
 
 This is what I actually use day to day. The agent runs while I sleep... literally. The dream cycle scans every conversation from the day, enriches missing entities, fixes broken citations, and consolidates memory. I wake up and the brain is smarter than when I went to sleep. OpenClaw ships this as DREAMS.md. Hermes Agent can do the same with a nightly cron job (see the [SKILLPACK](docs/GBRAIN_SKILLPACK.md#the-dream-cycle) for setup).
 
@@ -65,6 +66,21 @@ Every cycle through this loop adds knowledge. The agent enriches a person page a
 An agent without this loop answers from stale context. An agent with it gets smarter every conversation. The difference compounds daily.
 
 Never do anything twice. If you look someone up once, that lookup lives in the brain forever. If a pattern emerges across three meetings, the agent captures it. If you generate an original idea in conversation, it goes to `originals/` — your searchable intellectual archive.
+
+## Getting Data In
+
+Your brain gets new senses as they're built. Run `gbrain integrations` to see what's available.
+
+| Integration | Category | What It Does |
+|-------------|----------|-------------|
+| [Voice-to-Brain](recipes/twilio-voice-brain.md) | Sense | Phone calls create brain pages via Twilio + OpenAI Realtime |
+| Email-to-Brain | Sense | Gmail messages flow into entity pages *(coming soon)* |
+| X-to-Brain | Sense | Twitter monitoring with entity detection *(coming soon)* |
+| Calendar-to-Brain | Sense | Google Calendar events become meeting prep *(coming soon)* |
+
+Your agent sets up each integration for you. It reads the recipe, asks for API keys, validates each one, and runs a smoke test. [Markdown is code](docs/ethos/THIN_HARNESS_FAT_SKILLS.md) — the recipe IS the installer.
+
+See [Getting Data In](docs/integrations/README.md) for the full guide and the [Skillpack](docs/GBRAIN_SKILLPACK.md) for all capabilities.
 
 ## Architecture
 
