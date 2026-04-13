@@ -22,6 +22,14 @@ const DEBUG = process.env.GBRAIN_SEARCH_DEBUG === '1';
 export interface HybridSearchOpts extends SearchOpts {
   expansion?: boolean;
   expandFn?: (query: string) => Promise<string[]>;
+  /** Override default RRF K constant (default: 60). Lower values boost top-ranked results more. */
+  rrfK?: number;
+  /** Override dedup pipeline parameters. */
+  dedupOpts?: {
+    cosineThreshold?: number;
+    maxTypeRatio?: number;
+    maxPerPage?: number;
+  };
 }
 
 export async function hybridSearch(
@@ -74,7 +82,7 @@ export async function hybridSearch(
 
   // Merge all result lists via RRF (includes normalization + boost)
   const allLists = [...vectorLists, keywordResults];
-  let fused = rrfFusion(allLists);
+  let fused = rrfFusion(allLists, opts?.rrfK ?? RRF_K);
 
   // Cosine re-scoring before dedup so semantically better chunks survive
   if (queryEmbedding) {
@@ -82,7 +90,7 @@ export async function hybridSearch(
   }
 
   // Dedup
-  const deduped = dedupResults(fused);
+  const deduped = dedupResults(fused, opts?.dedupOpts);
 
   // Auto-escalate: if detail=low returned 0, retry with high
   if (deduped.length === 0 && opts?.detail === 'low') {
@@ -97,7 +105,7 @@ export async function hybridSearch(
  * Each result gets score = sum(1 / (K + rank)) across all lists it appears in.
  * After accumulation: normalize to 0-1, then boost compiled_truth chunks.
  */
-function rrfFusion(lists: SearchResult[][]): SearchResult[] {
+function rrfFusion(lists: SearchResult[][], k: number): SearchResult[] {
   const scores = new Map<string, { result: SearchResult; score: number }>();
 
   for (const list of lists) {
@@ -105,7 +113,7 @@ function rrfFusion(lists: SearchResult[][]): SearchResult[] {
       const r = list[rank];
       const key = `${r.slug}:${r.chunk_id ?? r.chunk_text.slice(0, 50)}`;
       const existing = scores.get(key);
-      const rrfScore = 1 / (RRF_K + rank);
+      const rrfScore = 1 / (k + rank);
 
       if (existing) {
         existing.score += rrfScore;
