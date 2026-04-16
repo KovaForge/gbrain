@@ -45,6 +45,19 @@
 
 **Depends on:** `gbrain serve --http` (not yet implemented).
 
+### Runtime MCP access control
+**What:** Add sender identity checking to MCP operations. Brain ops return filtered data based on access tier (Full/Work/Family/None).
+
+**Why:** ACCESS_POLICY.md is prompt-layer enforcement (agent reads policy before responding). A direct MCP caller can bypass it. Runtime enforcement in the MCP server is the real security boundary for multi-user and remote deployments.
+
+**Pros:** Real security boundary. ACCESS_POLICY.md becomes enforceable, not advisory.
+
+**Cons:** Requires adding `sender_id` or `access_tier` to `OperationContext`. Each mutating operation needs a permission check. Medium implementation effort.
+
+**Context:** From CEO review + Codex outside voice (2026-04-13). Prompt-layer access control works in practice (same model as Wintermute) but is not sufficient for remote MCP where direct tool calls bypass the agent's prompt.
+
+**Depends on:** v0.10.0 GStackBrain skill layer (shipped).
+
 ## P1 (new from v0.7.0)
 
 ### ~~Constrained health_check DSL for third-party recipes~~
@@ -55,7 +68,7 @@
 ### Community recipe submission (`gbrain integrations submit`)
 **What:** Package a user's custom integration recipe as a PR to the GBrain repo. Validates frontmatter, checks constrained DSL health_checks, creates PR with template.
 
-**Why:** Turns GBrain from "Garry's integrations" into a community ecosystem. The recipe format IS the contribution format.
+**Why:** Turns GBrain from a single-author integration set into a community ecosystem. The recipe format IS the contribution format.
 
 **Pros:** Community-driven integration library. Users build Slack-to-brain, RSS-to-brain, Discord-to-brain.
 
@@ -87,7 +100,7 @@
 
 **Cons:** Users need ngrok ($8/mo) or a cloud host (Fly.io $5/mo, Railway $5/mo). Not zero-infra.
 
-**Context:** The production deployment at wintermute uses a custom Hono server wrapping `gbrain serve`. This TODO would formalize that pattern into the CLI. ChatGPT OAuth 2.1 support depends on this.
+**Context:** Production deployments use a custom Hono server wrapping `gbrain serve`. This TODO would formalize that pattern into the CLI. ChatGPT OAuth 2.1 support depends on this.
 
 **Depends on:** v0.8.0 (Edge Function removal shipped).
 

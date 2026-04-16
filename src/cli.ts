@@ -18,7 +18,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot']);
 
 async function main() {
   const args = process.argv.slice(2);
@@ -278,6 +278,24 @@ async function handleCliOnly(command: string, args: string[]) {
     await runReport(args);
     return;
   }
+  if (command === 'doctor') {
+    // Doctor runs filesystem checks first (no DB needed), then DB checks.
+    // --fast skips DB checks entirely.
+    const { runDoctor } = await import('./commands/doctor.ts');
+    if (args.includes('--fast')) {
+      await runDoctor(null, args);
+    } else {
+      try {
+        const eng = await connectEngine();
+        await runDoctor(eng, args);
+        await eng.disconnect();
+      } catch {
+        // DB unavailable — still run filesystem checks
+        await runDoctor(null, args);
+      }
+    }
+    return;
+  }
 
   // All remaining CLI-only commands need a DB connection
   const engine = await connectEngine();
@@ -318,11 +336,7 @@ async function handleCliOnly(command: string, args: string[]) {
         await runConfig(engine, args);
         break;
       }
-      case 'doctor': {
-        const { runDoctor } = await import('./commands/doctor.ts');
-        await runDoctor(engine, args);
-        break;
-      }
+      // doctor is handled before connectEngine() above
       case 'migrate': {
         const { runMigrateEngine } = await import('./commands/migrate-engine.ts');
         await runMigrateEngine(engine, args);
@@ -332,6 +346,26 @@ async function handleCliOnly(command: string, args: string[]) {
         const { runEvalCommand } = await import('./commands/eval.ts');
         await runEvalCommand(engine, args);
         break;
+      }
+      case 'sync': {
+        const { runSync } = await import('./commands/sync.ts');
+        await runSync(engine, args);
+        break;
+      }
+      case 'extract': {
+        const { runExtract } = await import('./commands/extract.ts');
+        await runExtract(engine, args);
+        break;
+      }
+      case 'features': {
+        const { runFeatures } = await import('./commands/features.ts');
+        await runFeatures(engine, args);
+        break;
+      }
+      case 'autopilot': {
+        const { runAutopilot } = await import('./commands/autopilot.ts');
+        await runAutopilot(engine, args);
+        return; // autopilot doesn't disconnect (long-running)
       }
     }
   } finally {
@@ -383,7 +417,7 @@ SETUP
   migrate --to <supabase|pglite>     Transfer brain between engines
   upgrade                            Self-update
   check-update [--json]              Check for new versions
-  doctor [--json]                    Health check (pgvector, RLS, schema, embeddings)
+  doctor [--json] [--fast]            Health check (resolver, skills, pgvector, RLS, embeddings)
   integrations [subcommand]          Manage integration recipes (senses + reflexes)
 
 PAGES
@@ -400,6 +434,8 @@ SEARCH
 IMPORT/EXPORT
   import <dir> [--no-embed]          Import markdown directory
   sync [--repo <path>] [flags]       Git-to-brain incremental sync
+  sync --watch [--interval N]        Continuous sync (loops until stopped)
+  sync --install-cron                Install persistent sync daemon
   export [--dir ./out/]              Export to markdown
 
 FILES
@@ -429,6 +465,7 @@ TIMELINE
   timeline-add <slug> <date> <text>  Add timeline entry
 
 TOOLS
+  extract <links|timeline|all> [dir] Extract links/timeline from markdown into DB
   publish <page.md> [--password]     Shareable HTML (strips private data, optional AES-256)
   check-backlinks <check|fix> [dir]  Find/fix missing back-links across brain
   lint <dir|file> [--fix]            Catch LLM artifacts, placeholder dates, bad frontmatter
@@ -439,6 +476,8 @@ ADMIN
   health                             Brain health dashboard
   history <slug>                     Page version history
   revert <slug> <version-id>         Revert to version
+  features [--json] [--auto-fix]     Scan usage + recommend unused features
+  autopilot [--repo] [--interval N]  Self-maintaining brain daemon
   config [show|get|set] <key> [val]  Brain config
   serve                              MCP server (stdio)
   call <tool> '<json>'               Raw tool invocation
