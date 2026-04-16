@@ -9,7 +9,7 @@
 import type { BrainEngine } from '../engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import type { SearchResult, SearchOpts } from '../types.ts';
-import { embed } from '../embedding.ts';
+import { embed, hasEmbeddingProviderCredentials } from '../embedding.ts';
 import { dedupResults } from './dedup.ts';
 
 const RRF_K = 60;
@@ -31,8 +31,8 @@ export async function hybridSearch(
   // Run keyword search (always available, no API key needed)
   const keywordResults = await engine.searchKeyword(query, { limit: innerLimit });
 
-  // Skip vector search entirely if no OpenAI key is configured
-  if (!process.env.OPENAI_API_KEY) {
+  // Skip vector search entirely if no embedding provider credentials are configured
+  if (!hasEmbeddingProviderCredentials()) {
     return dedupResults(keywordResults).slice(offset, offset + limit);
   }
 

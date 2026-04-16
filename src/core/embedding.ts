@@ -2,28 +2,89 @@
  * Embedding Service
  * Ported from production Ruby implementation (embedding_service.rb, 190 LOC)
  *
- * OpenAI text-embedding-3-large at 1536 dimensions.
+ * Supports OpenAI and MiniMax embedding providers.
  * Retry with exponential backoff (4s base, 120s cap, 5 retries).
  * 8000 character input truncation.
  */
 
 import OpenAI from 'openai';
+import { loadConfig, type EmbeddingProvider } from './config.ts';
 
-const MODEL = 'text-embedding-3-large';
-const DIMENSIONS = 1536;
+const OPENAI_MODEL = 'text-embedding-3-large';
+const MINIMAX_MODEL = 'embo-01';
+const EMBEDDING_DIMENSIONS = 1536;
 const MAX_CHARS = 8000;
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 4000;
 const MAX_DELAY_MS = 120000;
 const BATCH_SIZE = 100;
+const MINIMAX_BASE_URL = 'https://api.minimax.io/v1';
 
-let client: OpenAI | null = null;
+let openaiClient: OpenAI | null = null;
+let openaiClientApiKey: string | undefined;
 
-function getClient(): OpenAI {
-  if (!client) {
-    client = new OpenAI();
+interface EmbeddingConfig {
+  provider: EmbeddingProvider;
+  model: string;
+  dimensions: number;
+  apiKey?: string;
+  baseUrl?: string;
+}
+
+interface MiniMaxEmbeddingResponse {
+  vectors?: number[][];
+  total_tokens?: number;
+  base_resp?: {
+    status_code?: number;
+    status_msg?: string;
+  };
+}
+
+function getEmbeddingConfig(): EmbeddingConfig {
+  const config = loadConfig();
+  const provider = config?.embedding_provider || 'openai';
+
+  if (provider === 'minimax') {
+    return {
+      provider,
+      model: config?.embedding_model || MINIMAX_MODEL,
+      dimensions: EMBEDDING_DIMENSIONS,
+      apiKey: config?.minimax_api_key,
+      baseUrl: config?.minimax_base_url || MINIMAX_BASE_URL,
+    };
   }
-  return client;
+
+  return {
+    provider: 'openai',
+    model: config?.embedding_model || OPENAI_MODEL,
+    dimensions: EMBEDDING_DIMENSIONS,
+    apiKey: config?.openai_api_key,
+  };
+}
+
+function getOpenAIClient(apiKey?: string): OpenAI {
+  if (!openaiClient || openaiClientApiKey !== apiKey) {
+    openaiClient = new OpenAI(apiKey ? { apiKey } : undefined);
+    openaiClientApiKey = apiKey;
+  }
+  return openaiClient;
+}
+
+export function getEmbeddingProvider(): EmbeddingProvider {
+  return getEmbeddingConfig().provider;
+}
+
+export function getEmbeddingModel(): string {
+  return getEmbeddingConfig().model;
+}
+
+export function getEmbeddingDimensions(): number {
+  return getEmbeddingConfig().dimensions;
+}
+
+export function hasEmbeddingProviderCredentials(): boolean {
+  const config = getEmbeddingConfig();
+  return Boolean(config.apiKey);
 }
 
 export async function embed(text: string): Promise<Float32Array> {
@@ -36,7 +97,6 @@ export async function embedBatch(texts: string[]): Promise<Float32Array[]> {
   const truncated = texts.map(t => t.slice(0, MAX_CHARS));
   const results: Float32Array[] = [];
 
-  // Process in batches of BATCH_SIZE
   for (let i = 0; i < truncated.length; i += BATCH_SIZE) {
     const batch = truncated.slice(i, i + BATCH_SIZE);
     const batchResults = await embedBatchWithRetry(batch);
@@ -47,24 +107,24 @@ export async function embedBatch(texts: string[]): Promise<Float32Array[]> {
 }
 
 async function embedBatchWithRetry(texts: string[]): Promise<Float32Array[]> {
+  const config = getEmbeddingConfig();
+
+  if (!config.apiKey) {
+    throw new Error(`Missing API key for embedding provider: ${config.provider}`);
+  }
+
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const response = await getClient().embeddings.create({
-        model: MODEL,
-        input: texts,
-        dimensions: DIMENSIONS,
-      });
-
-      // Sort by index to maintain order
-      const sorted = response.data.sort((a, b) => a.index - b.index);
-      return sorted.map(d => new Float32Array(d.embedding));
+      if (config.provider === 'minimax') {
+        return await createMiniMaxEmbeddings(texts, config);
+      }
+      return await createOpenAIEmbeddings(texts, config);
     } catch (e: unknown) {
       if (attempt === MAX_RETRIES - 1) throw e;
 
-      // Check for rate limit with Retry-After header
       let delay = exponentialDelay(attempt);
 
-      if (e instanceof OpenAI.APIError && e.status === 429) {
+      if (config.provider === 'openai' && e instanceof OpenAI.APIError && e.status === 429) {
         const retryAfter = e.headers?.['retry-after'];
         if (retryAfter) {
           const parsed = parseInt(retryAfter, 10);
@@ -78,8 +138,55 @@ async function embedBatchWithRetry(texts: string[]): Promise<Float32Array[]> {
     }
   }
 
-  // Should not reach here
   throw new Error('Embedding failed after all retries');
+}
+
+async function createOpenAIEmbeddings(texts: string[], config: EmbeddingConfig): Promise<Float32Array[]> {
+  const response = await getOpenAIClient(config.apiKey).embeddings.create({
+    model: config.model,
+    input: texts,
+    dimensions: config.dimensions,
+  });
+
+  const sorted = response.data.sort((a, b) => a.index - b.index);
+  return sorted.map(d => new Float32Array(d.embedding));
+}
+
+async function createMiniMaxEmbeddings(texts: string[], config: EmbeddingConfig): Promise<Float32Array[]> {
+  const response = await fetch(`${config.baseUrl}/embeddings`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${config.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: config.model,
+      texts,
+      type: 'db',
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`MiniMax embeddings request failed (${response.status}): ${body}`);
+  }
+
+  const data = await response.json() as MiniMaxEmbeddingResponse;
+  const statusCode = data.base_resp?.status_code;
+  if (statusCode && statusCode !== 0) {
+    throw new Error(data.base_resp?.status_msg || `MiniMax embeddings request failed with status_code ${statusCode}`);
+  }
+
+  if (!Array.isArray(data.vectors) || data.vectors.length !== texts.length) {
+    throw new Error('MiniMax embeddings response did not contain the expected vectors array');
+  }
+
+  return data.vectors.map((vector) => {
+    if (!Array.isArray(vector) || vector.length !== config.dimensions) {
+      throw new Error(`MiniMax embedding dimension mismatch: expected ${config.dimensions}, got ${Array.isArray(vector) ? vector.length : 'invalid'}`);
+    }
+    return new Float32Array(vector);
+  });
 }
 
 function exponentialDelay(attempt: number): number {
@@ -91,4 +198,4 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export { MODEL as EMBEDDING_MODEL, DIMENSIONS as EMBEDDING_DIMENSIONS };
+export { EMBEDDING_DIMENSIONS };

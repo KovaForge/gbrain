@@ -32,9 +32,10 @@ INSTALL:
 
 API KEYS — ask the user for these:
 
-  export OPENAI_API_KEY=sk-...          # required for vector search
+  export OPENAI_API_KEY=sk-...          # embeddings via OpenAI (optional)
+  export MINIMAX_API_KEY=...            # embeddings via MiniMax (optional)
   export ANTHROPIC_API_KEY=sk-ant-...   # optional, improves search quality
-  Save to shell profile or .env. Without OpenAI, keyword search still
+  Save to shell profile or .env. Without an embeddings key, keyword search still
   works. Without Anthropic, search works but skips query expansion.
 
 SET UP THE BRAIN:
@@ -231,19 +232,21 @@ You take a meeting with someone. The agent writes a brain page for them, links i
 | Dependency | What it's for | How to get it |
 |------------|--------------|---------------|
 | **Supabase account** | Postgres + pgvector database | [supabase.com](https://supabase.com) (Pro tier, $25/mo for 8GB) |
-| **OpenAI API key** | Embeddings (text-embedding-3-large) | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
+| **OpenAI API key** | Embeddings via `text-embedding-3-large` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
+| **MiniMax API key** | Embeddings via `embo-01` | MiniMax console |
 | **Anthropic API key** | Multi-query expansion + LLM chunking (Haiku) | [console.anthropic.com](https://console.anthropic.com) |
 
 Set the API keys as environment variables:
 
 ```bash
-export OPENAI_API_KEY=sk-...
+export OPENAI_API_KEY=sk-...      # or use MiniMax instead
+export MINIMAX_API_KEY=...        # optional alternative embeddings provider
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-The Supabase connection URL is configured during `gbrain init --supabase`. The OpenAI and Anthropic SDKs read their keys from the environment automatically.
+The Supabase connection URL is configured during `gbrain init --supabase`. OpenAI and Anthropic use their standard SDK environment variables. MiniMax embeddings use `MINIMAX_API_KEY`. You can choose the embeddings provider during init with `--embedding-provider openai|minimax`.
 
-Without an OpenAI key, search still works (keyword only, no vector search). Without an Anthropic key, search still works (no multi-query expansion, no LLM chunking).
+Without an embeddings key, search still works (keyword only, no vector search). Without an Anthropic key, search still works (no multi-query expansion, no LLM chunking).
 
 ### GBrain without OpenClaw
 
@@ -678,7 +681,7 @@ For a brain with ~7,500 pages:
 
 Supabase free tier (500MB) won't fit a large brain. Supabase Pro ($25/mo, 8GB) is the starting point.
 
-Initial embedding cost: ~$4-5 for 7,500 pages via OpenAI text-embedding-3-large.
+Initial embedding cost: ~$4-5 for 7,500 pages via OpenAI text-embedding-3-large. MiniMax `embo-01` is also supported as an embeddings provider.
 
 ## Docs
 

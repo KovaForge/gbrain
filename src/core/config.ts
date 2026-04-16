@@ -7,12 +7,18 @@ import type { EngineConfig } from './types.ts';
 function getConfigDir() { return join(homedir(), '.gbrain'); }
 function getConfigPath() { return join(getConfigDir(), 'config.json'); }
 
+export type EmbeddingProvider = 'openai' | 'minimax';
+
 export interface GBrainConfig {
   engine: 'postgres' | 'pglite';
   database_url?: string;
   database_path?: string;
   openai_api_key?: string;
   anthropic_api_key?: string;
+  minimax_api_key?: string;
+  minimax_base_url?: string;
+  embedding_provider?: EmbeddingProvider;
+  embedding_model?: string;
 }
 
 /**
@@ -41,6 +47,9 @@ export function loadConfig(): GBrainConfig | null {
     engine: inferredEngine,
     ...(dbUrl ? { database_url: dbUrl } : {}),
     ...(process.env.OPENAI_API_KEY ? { openai_api_key: process.env.OPENAI_API_KEY } : {}),
+    ...(process.env.ANTHROPIC_API_KEY ? { anthropic_api_key: process.env.ANTHROPIC_API_KEY } : {}),
+    ...(process.env.MINIMAX_API_KEY ? { minimax_api_key: process.env.MINIMAX_API_KEY } : {}),
+    ...(process.env.MINIMAX_BASE_URL ? { minimax_base_url: process.env.MINIMAX_BASE_URL } : {}),
   };
   return merged as GBrainConfig;
 }

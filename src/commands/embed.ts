@@ -1,5 +1,5 @@
 import type { BrainEngine } from '../core/engine.ts';
-import { embedBatch } from '../core/embedding.ts';
+import { embedBatch, getEmbeddingModel } from '../core/embedding.ts';
 import type { ChunkInput } from '../core/types.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 
@@ -54,6 +54,7 @@ async function embedPage(engine: BrainEngine, slug: string) {
   }
 
   const embeddings = await embedBatch(toEmbed.map(c => c.chunk_text));
+  const model = getEmbeddingModel();
   const embeddingMap = new Map<number, Float32Array>();
   for (let j = 0; j < toEmbed.length; j++) {
     embeddingMap.set(toEmbed[j].chunk_index, embeddings[j]);
@@ -63,6 +64,7 @@ async function embedPage(engine: BrainEngine, slug: string) {
     chunk_text: c.chunk_text,
     chunk_source: c.chunk_source,
     embedding: embeddingMap.get(c.chunk_index),
+    model: embeddingMap.has(c.chunk_index) ? model : c.model,
     token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
   }));
 
@@ -100,6 +102,7 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
 
     try {
       const embeddings = await embedBatch(toEmbed.map(c => c.chunk_text));
+      const model = getEmbeddingModel();
       // Build a map of new embeddings by chunk_index
       const embeddingMap = new Map<number, Float32Array>();
       for (let j = 0; j < toEmbed.length; j++) {
@@ -111,6 +114,7 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
         chunk_text: c.chunk_text,
         chunk_source: c.chunk_source,
         embedding: embeddingMap.get(c.chunk_index) ?? undefined,
+        model: embeddingMap.has(c.chunk_index) ? model : c.model,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
       await engine.upsertChunks(page.slug, updated);
