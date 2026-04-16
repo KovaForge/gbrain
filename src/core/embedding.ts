@@ -2,15 +2,15 @@
  * Embedding Service
  * Ported from production Ruby implementation (embedding_service.rb, 190 LOC)
  *
- * OpenAI text-embedding-3-large at 1536 dimensions.
+ * Default provider is OpenAI text-embedding-3-large at 1536 dimensions.
+ * Supports provider/base-url/model overrides for Minimax and OpenAI-compatible APIs.
  * Retry with exponential backoff (4s base, 120s cap, 5 retries).
  * 8000 character input truncation.
  */
 
 import OpenAI from 'openai';
+import { hasEmbeddingProvider, loadEmbeddingProviderConfig } from './provider-config.ts';
 
-const MODEL = 'text-embedding-3-large';
-const DIMENSIONS = 1536;
 const MAX_CHARS = 8000;
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 4000;
@@ -21,7 +21,14 @@ let client: OpenAI | null = null;
 
 function getClient(): OpenAI {
   if (!client) {
-    client = new OpenAI();
+    const cfg = loadEmbeddingProviderConfig();
+    if (!cfg?.apiKey) {
+      throw new Error('No embedding provider configured. Set OPENAI_API_KEY or MINIMAX_API_KEY.');
+    }
+    client = new OpenAI({
+      apiKey: cfg.apiKey,
+      ...(cfg.baseURL ? { baseURL: cfg.baseURL } : {}),
+    });
   }
   return client;
 }
@@ -49,10 +56,14 @@ export async function embedBatch(texts: string[]): Promise<Float32Array[]> {
 async function embedBatchWithRetry(texts: string[]): Promise<Float32Array[]> {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
+      const cfg = loadEmbeddingProviderConfig();
+      if (!cfg?.apiKey) {
+        throw new Error('No embedding provider configured. Set OPENAI_API_KEY or MINIMAX_API_KEY.');
+      }
       const response = await getClient().embeddings.create({
-        model: MODEL,
+        model: cfg.model,
         input: texts,
-        dimensions: DIMENSIONS,
+        ...(cfg.dimensions ? { dimensions: cfg.dimensions } : {}),
       });
 
       // Sort by index to maintain order
@@ -91,4 +102,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export { MODEL as EMBEDDING_MODEL, DIMENSIONS as EMBEDDING_DIMENSIONS };
+export const EMBEDDING_MODEL = () => loadEmbeddingProviderConfig()?.model || 'text-embedding-3-large';
+export const EMBEDDING_DIMENSIONS = () => loadEmbeddingProviderConfig()?.dimensions || 1536;
+export { hasEmbeddingProvider };
