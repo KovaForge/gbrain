@@ -3,6 +3,7 @@ import { readdirSync, lstatSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { saveConfig, type GBrainConfig } from '../core/config.ts';
+import { loadEmbeddingProviderConfig } from '../core/provider-config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 
 export async function runInit(args: string[]) {
@@ -14,8 +15,33 @@ export async function runInit(args: string[]) {
   const manualUrl = urlIndex !== -1 ? args[urlIndex + 1] : null;
   const keyIndex = args.indexOf('--key');
   const apiKey = keyIndex !== -1 ? args[keyIndex + 1] : null;
+  const embeddingProviderIndex = args.indexOf('--embedding-provider');
+  const embeddingProvider = embeddingProviderIndex !== -1 ? args[embeddingProviderIndex + 1] : null;
+  const baseUrlIndex = args.indexOf('--embedding-base-url');
+  const embeddingBaseUrl = baseUrlIndex !== -1 ? args[baseUrlIndex + 1] : null;
+  const modelIndex = args.indexOf('--embedding-model');
+  const embeddingModel = modelIndex !== -1 ? args[modelIndex + 1] : null;
+  const dimensionsIndex = args.indexOf('--embedding-dimensions');
+  const embeddingDimensionsRaw = dimensionsIndex !== -1 ? args[dimensionsIndex + 1] : null;
+  const openaiKeyIndex = args.indexOf('--openai-key');
+  const openaiKey = openaiKeyIndex !== -1 ? args[openaiKeyIndex + 1] : null;
+  const minimaxKeyIndex = args.indexOf('--minimax-key');
+  const minimaxKey = minimaxKeyIndex !== -1 ? args[minimaxKeyIndex + 1] : null;
+  const genericKeyIndex = args.indexOf('--embedding-key');
+  const genericKey = genericKeyIndex !== -1 ? args[genericKeyIndex + 1] : null;
   const pathIndex = args.indexOf('--path');
   const customPath = pathIndex !== -1 ? args[pathIndex + 1] : null;
+
+  const providerConfig = buildEmbeddingConfig({
+    embeddingProvider,
+    legacyApiKey: apiKey,
+    genericKey,
+    openaiKey,
+    minimaxKey,
+    embeddingBaseUrl,
+    embeddingModel,
+    embeddingDimensionsRaw,
+  });
 
   // Explicit PGLite mode
   if (isPGLite || (!isSupabase && !manualUrl && !isNonInteractive)) {
@@ -33,7 +59,7 @@ export async function runInit(args: string[]) {
       }
     }
 
-    return initPGLite({ jsonOutput, apiKey, customPath });
+    return initPGLite({ jsonOutput, customPath, providerConfig });
   }
 
   // Supabase/Postgres mode
@@ -52,10 +78,10 @@ export async function runInit(args: string[]) {
     databaseUrl = await supabaseWizard();
   }
 
-  return initPostgres({ databaseUrl, jsonOutput, apiKey });
+  return initPostgres({ databaseUrl, jsonOutput, providerConfig });
 }
 
-async function initPGLite(opts: { jsonOutput: boolean; apiKey: string | null; customPath: string | null }) {
+async function initPGLite(opts: { jsonOutput: boolean; customPath: string | null; providerConfig: ReturnType<typeof buildEmbeddingConfig> }) {
   const dbPath = opts.customPath || join(homedir(), '.gbrain', 'brain.pglite');
   console.log(`Setting up local brain with PGLite (no server needed)...`);
 
@@ -66,7 +92,7 @@ async function initPGLite(opts: { jsonOutput: boolean; apiKey: string | null; cu
   const config: GBrainConfig = {
     engine: 'pglite',
     database_path: dbPath,
-    ...(opts.apiKey ? { openai_api_key: opts.apiKey } : {}),
+    ...opts.providerConfig,
   };
   saveConfig(config);
 
@@ -84,7 +110,7 @@ async function initPGLite(opts: { jsonOutput: boolean; apiKey: string | null; cu
   }
 }
 
-async function initPostgres(opts: { databaseUrl: string; jsonOutput: boolean; apiKey: string | null }) {
+async function initPostgres(opts: { databaseUrl: string; jsonOutput: boolean; providerConfig: ReturnType<typeof buildEmbeddingConfig> }) {
   const { databaseUrl } = opts;
 
   // Detect Supabase direct connection URLs and warn about IPv6
@@ -137,7 +163,7 @@ async function initPostgres(opts: { databaseUrl: string; jsonOutput: boolean; ap
   const config: GBrainConfig = {
     engine: 'postgres',
     database_url: databaseUrl,
-    ...(opts.apiKey ? { openai_api_key: opts.apiKey } : {}),
+    ...opts.providerConfig,
   };
   saveConfig(config);
   console.log('Config saved to ~/.gbrain/config.json');
@@ -201,6 +227,57 @@ async function supabaseWizard(): Promise<string> {
     process.exit(1);
   }
   return url;
+}
+
+function buildEmbeddingConfig(opts: {
+  embeddingProvider: string | null;
+  legacyApiKey: string | null;
+  genericKey: string | null;
+  openaiKey: string | null;
+  minimaxKey: string | null;
+  embeddingBaseUrl: string | null;
+  embeddingModel: string | null;
+  embeddingDimensionsRaw: string | null;
+}): Partial<GBrainConfig> {
+  const provider = normalizeProvider(opts.embeddingProvider, opts.minimaxKey, opts.genericKey, opts.embeddingBaseUrl);
+  const dimensions = parseOptionalInt(opts.embeddingDimensionsRaw);
+
+  const config: Partial<GBrainConfig> = {};
+
+  if (provider) config.embedding_provider = provider;
+  if (opts.embeddingBaseUrl) config.embedding_base_url = opts.embeddingBaseUrl;
+  if (opts.embeddingModel) config.embedding_model = opts.embeddingModel;
+  if (dimensions !== undefined) config.embedding_dimensions = dimensions;
+
+  if (provider === 'minimax') {
+    if (opts.minimaxKey || opts.legacyApiKey || opts.genericKey) config.minimax_api_key = opts.minimaxKey || opts.legacyApiKey || opts.genericKey || undefined;
+    if (!config.embedding_model) config.embedding_model = 'embo-01';
+    if (!config.embedding_base_url) config.embedding_base_url = 'https://api.minimax.io/v1';
+  } else if (provider === 'openai-compatible') {
+    if (opts.genericKey) config.openai_api_key = opts.genericKey;
+  } else {
+    if (opts.openaiKey || opts.legacyApiKey || opts.genericKey) config.openai_api_key = opts.openaiKey || opts.legacyApiKey || opts.genericKey || undefined;
+  }
+
+  return config;
+}
+
+function normalizeProvider(provider: string | null, minimaxKey: string | null, genericKey: string | null, embeddingBaseUrl: string | null): GBrainConfig['embedding_provider'] | undefined {
+  if (provider === 'openai' || provider === 'minimax' || provider === 'openai-compatible') return provider;
+  if (provider) {
+    console.error('--embedding-provider must be one of: openai, minimax, openai-compatible');
+    process.exit(1);
+  }
+  if (minimaxKey) return 'minimax';
+  if (genericKey && embeddingBaseUrl) return 'openai-compatible';
+  if (loadEmbeddingProviderConfig()?.provider) return loadEmbeddingProviderConfig()?.provider;
+  return 'openai';
+}
+
+function parseOptionalInt(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function readLine(prompt: string): Promise<string> {

@@ -1,6 +1,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import * as db from '../core/db.ts';
 import { LATEST_VERSION } from '../core/migrate.ts';
+import { loadEmbeddingProviderConfig } from '../core/provider-config.ts';
 
 interface Check {
   name: string;
@@ -71,14 +72,19 @@ export async function runDoctor(engine: BrainEngine, args: string[]) {
 
   // 5. Embedding health
   try {
-    const health = await engine.getHealth();
-    const pct = (health.embed_coverage * 100).toFixed(0);
-    if (health.embed_coverage >= 0.9) {
-      checks.push({ name: 'embeddings', status: 'ok', message: `${pct}% coverage, ${health.missing_embeddings} missing` });
-    } else if (health.embed_coverage > 0) {
-      checks.push({ name: 'embeddings', status: 'warn', message: `${pct}% coverage, ${health.missing_embeddings} missing. Run: gbrain embed refresh` });
+    const provider = loadEmbeddingProviderConfig();
+    if (!provider?.apiKey) {
+      checks.push({ name: 'embeddings', status: 'warn', message: 'No embedding provider configured. Set OPENAI_API_KEY or MINIMAX_API_KEY.' });
     } else {
-      checks.push({ name: 'embeddings', status: 'warn', message: 'No embeddings yet. Run: gbrain embed refresh' });
+      const health = await engine.getHealth();
+      const pct = (health.embed_coverage * 100).toFixed(0);
+      if (health.embed_coverage >= 0.9) {
+        checks.push({ name: 'embeddings', status: 'ok', message: `${pct}% coverage via ${provider.provider}, ${health.missing_embeddings} missing` });
+      } else if (health.embed_coverage > 0) {
+        checks.push({ name: 'embeddings', status: 'warn', message: `${pct}% coverage via ${provider.provider}, ${health.missing_embeddings} missing. Run: gbrain embed --stale` });
+      } else {
+        checks.push({ name: 'embeddings', status: 'warn', message: `No embeddings yet for provider "${provider.provider}". Run: gbrain embed --all` });
+      }
     }
   } catch {
     checks.push({ name: 'embeddings', status: 'warn', message: 'Could not check embedding health' });
