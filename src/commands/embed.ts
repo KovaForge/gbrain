@@ -1,5 +1,6 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { embedBatch } from '../core/embedding.ts';
+import { loadEmbeddingProviderConfig } from '../core/provider-config.ts';
 import type { ChunkInput } from '../core/types.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 
@@ -90,11 +91,10 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
   // Each worker pulls pages from a shared queue and makes independent
   // embedBatch calls to OpenAI + upsertChunks to the engine.
   //
-  // Default 20: keeps us well under OpenAI's embedding RPM limit
-  // (3000+/min for tier 1 = 50+/sec, 20 parallel is safely below) and
-  // avoids overwhelming postgres connection pools. Users can tune via
-  // GBRAIN_EMBED_CONCURRENCY env var based on their tier/infra.
-  const CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
+  // Default 20 for OpenAI-class providers; MiniMax defaults to serial
+  // page work so embed --all does not burst into RPM throttling.
+  // Users can still override via GBRAIN_EMBED_CONCURRENCY.
+  const CONCURRENCY = getEmbedConcurrency();
 
   async function embedOnePage(page: typeof pages[number]) {
     const chunks = await engine.getChunks(page.slug);
@@ -151,4 +151,13 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
   await Promise.all(Array.from({ length: numWorkers }, () => worker()));
 
   console.log(`\n\nEmbedded ${embedded} chunks across ${pages.length} pages`);
+}
+
+function getEmbedConcurrency(): number {
+  const configured = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '', 10);
+  if (Number.isFinite(configured) && configured > 0) {
+    return configured;
+  }
+
+  return loadEmbeddingProviderConfig()?.provider === 'minimax' ? 1 : 20;
 }

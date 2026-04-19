@@ -51,6 +51,7 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.GBRAIN_EMBED_CONCURRENCY;
+  delete process.env.MINIMAX_API_KEY;
 });
 
 describe('runEmbed --all (parallel)', () => {
@@ -98,6 +99,29 @@ describe('runEmbed --all (parallel)', () => {
     });
 
     process.env.GBRAIN_EMBED_CONCURRENCY = '1';
+
+    await runEmbed(engine, ['--all']);
+
+    expect(totalEmbedCalls).toBe(5);
+    expect(maxConcurrentEmbedCalls).toBe(1);
+  });
+
+  test('defaults to serial embedding for MiniMax', async () => {
+    const pages = Array.from({ length: 5 }, (_, i) => ({ slug: `page-${i}` }));
+    const chunksBySlug = new Map(
+      pages.map(p => [
+        p.slug,
+        [{ chunk_index: 0, chunk_text: `text ${p.slug}`, chunk_source: 'compiled_truth', embedded_at: null, token_count: 4 }],
+      ]),
+    );
+
+    const engine = mockEngine({
+      listPages: async () => pages,
+      getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
+      upsertChunks: async () => {},
+    });
+
+    process.env.MINIMAX_API_KEY = 'test-key';
 
     await runEmbed(engine, ['--all']);
 
