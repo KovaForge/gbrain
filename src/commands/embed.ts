@@ -1,68 +1,19 @@
 import type { BrainEngine } from '../core/engine.ts';
-import { embedBatch } from '../core/embedding.ts';
-import { loadEmbeddingProviderConfig } from '../core/provider-config.ts';
+import { embedBatch, getEmbeddingModel } from '../core/embedding.ts';
 import type { ChunkInput } from '../core/types.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 
-export interface EmbedOpts {
-  /** Embed ALL pages (every chunk). */
-  all?: boolean;
-  /** Embed only stale chunks (missing embedding). */
-  stale?: boolean;
-  /** Embed specific pages by slug. */
-  slugs?: string[];
-  /** Embed a single page. */
-  slug?: string;
-}
-
-/**
- * Library-level embed. Throws on validation errors; per-page embed failures
- * are logged to stderr but do not throw (matches the existing CLI semantics
- * for batch runs). Safe to call from Minions handlers — no process.exit.
- */
-export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promise<void> {
-  if (opts.slugs && opts.slugs.length > 0) {
-    for (const s of opts.slugs) {
-      try { await embedPage(engine, s); } catch (e: unknown) {
-        console.error(`  Error embedding ${s}: ${e instanceof Error ? e.message : e}`);
-      }
-    }
-    return;
-  }
-  if (opts.all || opts.stale) {
-    await embedAll(engine, !!opts.stale);
-    return;
-  }
-  if (opts.slug) {
-    await embedPage(engine, opts.slug);
-    return;
-  }
-  throw new Error('No embed target specified. Pass { slug }, { slugs }, { all }, or { stale }.');
-}
-
 export async function runEmbed(engine: BrainEngine, args: string[]) {
-  const slugsIdx = args.indexOf('--slugs');
+  const slug = args.find(a => !a.startsWith('--'));
   const all = args.includes('--all');
   const stale = args.includes('--stale');
 
-  let opts: EmbedOpts;
-  if (slugsIdx >= 0) {
-    opts = { slugs: args.slice(slugsIdx + 1).filter(a => !a.startsWith('--')) };
+  if (slug) {
+    await embedPage(engine, slug);
   } else if (all || stale) {
-    opts = { all, stale };
+    await embedAll(engine, stale);
   } else {
-    const slug = args.find(a => !a.startsWith('--'));
-    if (!slug) {
-      console.error('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...]');
-      process.exit(1);
-    }
-    opts = { slug };
-  }
-
-  try {
-    await runEmbedCore(engine, opts);
-  } catch (e) {
-    console.error(e instanceof Error ? e.message : String(e));
+    console.error('Usage: gbrain embed [<slug>|--all|--stale]');
     process.exit(1);
   }
 }
@@ -70,7 +21,8 @@ export async function runEmbed(engine: BrainEngine, args: string[]) {
 async function embedPage(engine: BrainEngine, slug: string) {
   const page = await engine.getPage(slug);
   if (!page) {
-    throw new Error(`Page not found: ${slug}`);
+    console.error(`Page not found: ${slug}`);
+    process.exit(1);
   }
 
   // Get existing chunks or create new ones
@@ -102,6 +54,7 @@ async function embedPage(engine: BrainEngine, slug: string) {
   }
 
   const embeddings = await embedBatch(toEmbed.map(c => c.chunk_text));
+  const model = getEmbeddingModel();
   const embeddingMap = new Map<number, Float32Array>();
   for (let j = 0; j < toEmbed.length; j++) {
     embeddingMap.set(toEmbed[j].chunk_index, embeddings[j]);
@@ -111,6 +64,7 @@ async function embedPage(engine: BrainEngine, slug: string) {
     chunk_text: c.chunk_text,
     chunk_source: c.chunk_source,
     embedding: embeddingMap.get(c.chunk_index),
+    model: embeddingMap.has(c.chunk_index) ? model : c.model,
     token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
   }));
 
@@ -128,10 +82,11 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
   // Each worker pulls pages from a shared queue and makes independent
   // embedBatch calls to OpenAI + upsertChunks to the engine.
   //
-  // Default 20 for OpenAI-class providers; MiniMax defaults to serial
-  // page work so embed --all does not burst into RPM throttling.
-  // Users can still override via GBRAIN_EMBED_CONCURRENCY.
-  const CONCURRENCY = getEmbedConcurrency();
+  // Default 20: keeps us well under OpenAI's embedding RPM limit
+  // (3000+/min for tier 1 = 50+/sec, 20 parallel is safely below) and
+  // avoids overwhelming postgres connection pools. Users can tune via
+  // GBRAIN_EMBED_CONCURRENCY env var based on their tier/infra.
+  const CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
 
   async function embedOnePage(page: typeof pages[number]) {
     const chunks = await engine.getChunks(page.slug);
@@ -147,6 +102,7 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
 
     try {
       const embeddings = await embedBatch(toEmbed.map(c => c.chunk_text));
+      const model = getEmbeddingModel();
       // Build a map of new embeddings by chunk_index
       const embeddingMap = new Map<number, Float32Array>();
       for (let j = 0; j < toEmbed.length; j++) {
@@ -158,6 +114,7 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
         chunk_text: c.chunk_text,
         chunk_source: c.chunk_source,
         embedding: embeddingMap.get(c.chunk_index) ?? undefined,
+        model: embeddingMap.has(c.chunk_index) ? model : c.model,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
       await engine.upsertChunks(page.slug, updated);
@@ -188,13 +145,4 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
   await Promise.all(Array.from({ length: numWorkers }, () => worker()));
 
   console.log(`\n\nEmbedded ${embedded} chunks across ${pages.length} pages`);
-}
-
-function getEmbedConcurrency(): number {
-  const configured = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '', 10);
-  if (Number.isFinite(configured) && configured > 0) {
-    return configured;
-  }
-
-  return loadEmbeddingProviderConfig()?.provider === 'minimax' ? 1 : 20;
 }

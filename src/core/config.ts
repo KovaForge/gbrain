@@ -7,6 +7,8 @@ import type { EngineConfig } from './types.ts';
 function getConfigDir() { return join(homedir(), '.gbrain'); }
 function getConfigPath() { return join(getConfigDir(), 'config.json'); }
 
+export type EmbeddingProvider = 'openai' | 'minimax';
+
 export interface GBrainConfig {
   engine: 'postgres' | 'pglite';
   database_url?: string;
@@ -14,7 +16,9 @@ export interface GBrainConfig {
   openai_api_key?: string;
   anthropic_api_key?: string;
   minimax_api_key?: string;
-  embedding_provider?: string;
+  minimax_group_id?: string;
+  minimax_base_url?: string;
+  embedding_provider?: EmbeddingProvider;
   embedding_base_url?: string;
   embedding_model?: string;
   embedding_dimensions?: number;
@@ -31,23 +35,23 @@ export function loadConfig(): GBrainConfig | null {
     fileConfig = JSON.parse(raw) as GBrainConfig;
   } catch { /* no config file */ }
 
-  // Try env vars
   const dbUrl = process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL;
 
   if (!fileConfig && !dbUrl) return null;
 
-  // Infer engine type if not explicitly set
   const inferredEngine: 'postgres' | 'pglite' = fileConfig?.engine
     || (fileConfig?.database_path ? 'pglite' : 'postgres');
 
-  // Merge: env vars override config file
   const merged = {
     ...fileConfig,
     engine: inferredEngine,
     ...(dbUrl ? { database_url: dbUrl } : {}),
     ...(process.env.OPENAI_API_KEY ? { openai_api_key: process.env.OPENAI_API_KEY } : {}),
+    ...(process.env.ANTHROPIC_API_KEY ? { anthropic_api_key: process.env.ANTHROPIC_API_KEY } : {}),
     ...(process.env.MINIMAX_API_KEY ? { minimax_api_key: process.env.MINIMAX_API_KEY } : {}),
-    ...(process.env.GBRAIN_EMBEDDING_PROVIDER ? { embedding_provider: process.env.GBRAIN_EMBEDDING_PROVIDER } : {}),
+    ...(process.env.MINIMAX_GROUP_ID ? { minimax_group_id: process.env.MINIMAX_GROUP_ID } : {}),
+    ...(process.env.MINIMAX_BASE_URL ? { minimax_base_url: process.env.MINIMAX_BASE_URL } : {}),
+    ...(process.env.GBRAIN_EMBEDDING_PROVIDER ? { embedding_provider: process.env.GBRAIN_EMBEDDING_PROVIDER as EmbeddingProvider } : {}),
     ...(process.env.GBRAIN_EMBEDDING_BASE_URL ? { embedding_base_url: process.env.GBRAIN_EMBEDDING_BASE_URL } : {}),
     ...(process.env.GBRAIN_EMBEDDING_MODEL ? { embedding_model: process.env.GBRAIN_EMBEDDING_MODEL } : {}),
     ...(process.env.GBRAIN_EMBEDDING_DIMENSIONS ? { embedding_dimensions: parseInt(process.env.GBRAIN_EMBEDDING_DIMENSIONS, 10) } : {}),
