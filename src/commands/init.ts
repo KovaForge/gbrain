@@ -6,7 +6,7 @@ import { homedir } from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-import { saveConfig, type GBrainConfig } from '../core/config.ts';
+import { saveConfig, loadConfig, toEngineConfig, type GBrainConfig } from '../core/config.ts';
 import { loadEmbeddingProviderConfig } from '../core/provider-config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 
@@ -47,6 +47,15 @@ export async function runInit(args: string[]) {
     embeddingDimensionsRaw,
   });
 
+  // Schema-only path: apply initSchema against the already-configured engine
+  // without ever calling saveConfig. Used by apply-migrations, the stopgap
+  // script, and the postinstall hook. Bare `gbrain init` defaults to PGLite
+  // and overwrites any existing Postgres config, we must never take that
+  // branch from a migration orchestrator.
+  if (isMigrateOnly) {
+    return initMigrateOnly({ jsonOutput });
+  }
+
   // Explicit PGLite mode
   if (isPGLite || (!isSupabase && !manualUrl && !isNonInteractive)) {
     // Smart detection: scan for .md files unless --pglite flag forces it
@@ -83,6 +92,39 @@ export async function runInit(args: string[]) {
   }
 
   return initPostgres({ databaseUrl, jsonOutput, providerConfig });
+}
+
+/**
+ * Apply the schema against the already-configured engine. No saveConfig.
+ * No PGLite fallback when no config exists. Used by migration orchestrators
+ * to bump an existing brain's schema to the latest version without
+ * clobbering the user's chosen engine.
+ */
+async function initMigrateOnly(opts: { jsonOutput: boolean }) {
+  const config = loadConfig();
+  if (!config) {
+    const msg = 'No brain configured. Run `gbrain init` (interactive) or `gbrain init --pglite` / `gbrain init --supabase` first.';
+    if (opts.jsonOutput) {
+      console.log(JSON.stringify({ status: 'error', reason: 'no_config', message: msg }));
+    } else {
+      console.error(msg);
+    }
+    process.exit(1);
+  }
+
+  const engine = await createEngine(toEngineConfig(config));
+  try {
+    await engine.connect(toEngineConfig(config));
+    await engine.initSchema();
+  } finally {
+    try { await engine.disconnect(); } catch { }
+  }
+
+  if (opts.jsonOutput) {
+    console.log(JSON.stringify({ status: 'success', engine: config.engine, mode: 'migrate-only' }));
+  } else {
+    console.log(`Schema up to date (engine: ${config.engine}).`);
+  }
 }
 
 async function initPGLite(opts: { jsonOutput: boolean; customPath: string | null; providerConfig: ReturnType<typeof buildEmbeddingConfig> }) {

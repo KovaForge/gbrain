@@ -55,6 +55,18 @@ export async function hybridSearch(
 
   // Skip vector search entirely if no embedding provider is configured
   if (!hasEmbeddingProvider()) {
+    // Apply backlink boost in keyword-only path too. One getBacklinkCounts query
+    // per search request, not N+1.
+    if (keywordResults.length > 0) {
+      try {
+        const slugs = Array.from(new Set(keywordResults.map(r => r.slug)));
+        const counts = await engine.getBacklinkCounts(slugs);
+        applyBacklinkBoost(keywordResults, counts);
+        keywordResults.sort((a, b) => b.score - a.score);
+      } catch {
+        // Boost failure is non-fatal, keep unboosted ranking.
+      }
+    }
     return dedupResults(keywordResults).slice(offset, offset + limit);
   }
 
