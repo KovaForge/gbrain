@@ -237,7 +237,7 @@ async function embedWithMinimax(
   const response = await fetch(url, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${cfg.apiKey}`,
+      Authorization: cfg.apiKey,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -301,6 +301,10 @@ function getBatchSize(): number {
 
   const provider = loadEmbeddingProviderConfig()?.provider || getEmbeddingConfig().provider;
   return provider === 'minimax' ? 1 : DEFAULT_BATCH_SIZE;
+}
+
+function exponentialDelay(attempt: number): number {
+  return Math.min(BASE_DELAY_MS * (2 ** attempt), MAX_DELAY_MS);
 }
 
 function getMinimaxRetryAfterMs(headers: Headers): number {

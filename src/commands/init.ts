@@ -14,6 +14,7 @@ export async function runInit(args: string[]) {
   const isSupabase = args.includes('--supabase');
   const isPGLite = args.includes('--pglite');
   const isNonInteractive = args.includes('--non-interactive');
+  const isMigrateOnly = args.includes('--migrate-only');
   const jsonOutput = args.includes('--json');
   const urlIndex = args.indexOf('--url');
   const manualUrl = urlIndex !== -1 ? args[urlIndex + 1] : null;
