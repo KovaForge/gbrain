@@ -19,7 +19,7 @@ export interface Check {
  * Filesystem checks (resolver, conformance) run without engine.
  * DB checks run only if engine is provided.
  */
-export async function runDoctor(engine: BrainEngine | null, args: string[]) {
+export async function runDoctor(engine: BrainEngine | null, args: string[]): Promise<number> {
   const jsonOutput = args.includes('--json');
   const fastMode = args.includes('--fast');
   const checks: Check[] = [];
@@ -131,8 +131,7 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
       checks.push({ name: 'connection', status: 'warn', message: 'No database configured (filesystem checks only)' });
     }
     const earlyFail1 = outputResults(checks, jsonOutput);
-    process.exit(earlyFail1 ? 1 : 0);
-    return;
+    return earlyFail1 ? 1 : 0;
   }
 
   // 3. Connection
@@ -143,8 +142,7 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
     const msg = e instanceof Error ? e.message : String(e);
     checks.push({ name: 'connection', status: 'fail', message: msg });
     const earlyFail2 = outputResults(checks, jsonOutput);
-    process.exit(earlyFail2 ? 1 : 0);
-    return;
+    return earlyFail2 ? 1 : 0;
   }
 
   // 4. pgvector extension
@@ -345,7 +343,7 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
     } catch { /* best-effort */ }
   }
 
-  process.exit(hasFail ? 1 : 0);
+  return hasFail ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------

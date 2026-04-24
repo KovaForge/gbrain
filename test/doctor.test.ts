@@ -36,9 +36,9 @@ describe('doctor command', () => {
 
   test('runDoctor accepts null engine for filesystem-only mode', async () => {
     const { runDoctor } = await import('../src/commands/doctor.ts');
-    // runDoctor should accept null engine — it runs filesystem checks only
-    // We can't call it directly (it calls process.exit), but we verify the signature
-    expect(runDoctor.length).toBe(2); // engine, args
+    const exitCode = await runDoctor(null, ['--fast', '--json']);
+    expect(runDoctor.length).toBe(2);
+    expect(typeof exitCode).toBe('number');
   });
 
   // v0.12.2 reliability wave — doctor detects JSONB double-encode + truncated

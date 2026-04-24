@@ -1,19 +1,32 @@
 import type { BrainEngine } from '../core/engine.ts';
-import { embedBatch, getEmbeddingModel } from '../core/embedding.ts';
+import { embedBatch, getEmbeddingModel, isEmbeddingRateLimitError } from '../core/embedding.ts';
+import { loadEmbeddingProviderConfig } from '../core/provider-config.ts';
 import type { ChunkInput } from '../core/types.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 
 export async function runEmbed(engine: BrainEngine, args: string[]) {
   const slug = args.find(a => !a.startsWith('--'));
+  const slugsIdx = args.indexOf('--slugs');
   const all = args.includes('--all');
   const stale = args.includes('--stale');
 
-  if (slug) {
+  if (slugsIdx >= 0) {
+    // --slugs slug1 slug2 ... (embed specific pages)
+    const slugs = args.slice(slugsIdx + 1).filter(a => !a.startsWith('--'));
+    for (const s of slugs) {
+      try { await embedPage(engine, s); } catch (e: unknown) {
+        if (isEmbeddingRateLimitError(e)) {
+          throw new Error(formatEmbeddingRateLimitAbortMessage(e));
+        }
+        console.error(`  Error embedding ${s}: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+  } else if (slug) {
     await embedPage(engine, slug);
   } else if (all || stale) {
     await embedAll(engine, stale);
   } else {
-    console.error('Usage: gbrain embed [<slug>|--all|--stale]');
+    console.error('Usage: gbrain embed [<slug>|--slugs <slug...>|--all|--stale]');
     process.exit(1);
   }
 }
@@ -75,6 +88,7 @@ async function embedPage(engine: BrainEngine, slug: string) {
 async function embedAll(engine: BrainEngine, staleOnly: boolean) {
   const pages = await engine.listPages({ limit: 100000 });
   let total = 0;
+  let abortReason: string | null = null;
   let embedded = 0;
   let processed = 0;
 
@@ -86,9 +100,11 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
   // (3000+/min for tier 1 = 50+/sec, 20 parallel is safely below) and
   // avoids overwhelming postgres connection pools. Users can tune via
   // GBRAIN_EMBED_CONCURRENCY env var based on their tier/infra.
-  const CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
+  const CONCURRENCY = getEmbedConcurrency();
 
   async function embedOnePage(page: typeof pages[number]) {
+    if (abortReason) return;
+
     const chunks = await engine.getChunks(page.slug);
     const toEmbed = staleOnly
       ? chunks.filter(c => !c.embedded_at)
@@ -121,6 +137,9 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
       embedded += toEmbed.length;
     } catch (e: unknown) {
       console.error(`\n  Error embedding ${page.slug}: ${e instanceof Error ? e.message : e}`);
+      if (isEmbeddingRateLimitError(e)) {
+        abortReason = formatEmbeddingRateLimitAbortMessage(e);
+      }
     }
 
     total += toEmbed.length;
@@ -135,7 +154,7 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
   // don't wait for slow workers to finish an entire window.
   let nextIdx = 0;
   async function worker() {
-    while (nextIdx < pages.length) {
+    while (!abortReason && nextIdx < pages.length) {
       const idx = nextIdx++;
       await embedOnePage(pages[idx]);
     }
@@ -144,5 +163,33 @@ async function embedAll(engine: BrainEngine, staleOnly: boolean) {
   const numWorkers = Math.min(CONCURRENCY, pages.length);
   await Promise.all(Array.from({ length: numWorkers }, () => worker()));
 
+  if (abortReason) {
+    throw new Error(abortReason);
+  }
+
   console.log(`\n\nEmbedded ${embedded} chunks across ${pages.length} pages`);
+}
+
+function getEmbedConcurrency(): number {
+  const configured = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '', 10);
+  if (Number.isFinite(configured) && configured > 0) {
+    return configured;
+  }
+
+  return loadEmbeddingProviderConfig()?.provider === 'minimax' ? 1 : 20;
+}
+
+function formatEmbeddingRateLimitAbortMessage(error: {
+  message: string;
+  provider?: string;
+  traceId?: string;
+  requestId?: string;
+}): string {
+  const provider = error.provider || 'embedding provider';
+  const refs = [
+    error.traceId ? `trace-id ${error.traceId}` : null,
+    error.requestId ? `request-id ${error.requestId}` : null,
+  ].filter(Boolean).join(', ');
+  const suffix = refs ? ` (${refs})` : '';
+  return `Embedding aborted: ${provider} is currently rate-limiting this API key/account. ${error.message}${suffix}. Wait for quota reset or switch to a different embedding provider.`;
 }

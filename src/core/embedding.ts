@@ -50,11 +50,28 @@ interface EmbeddingConfig {
 
 class EmbeddingRateLimitError extends Error {
   retryAfterMs: number;
+  provider?: string;
+  traceId?: string;
+  requestId?: string;
+  statusCode?: number;
 
-  constructor(message: string, retryAfterMs: number) {
+  constructor(
+    message: string,
+    retryAfterMs: number,
+    opts?: {
+      provider?: string;
+      traceId?: string;
+      requestId?: string;
+      statusCode?: number;
+    },
+  ) {
     super(message);
     this.name = 'EmbeddingRateLimitError';
     this.retryAfterMs = retryAfterMs;
+    this.provider = opts?.provider;
+    this.traceId = opts?.traceId;
+    this.requestId = opts?.requestId;
+    this.statusCode = opts?.statusCode;
   }
 }
 
@@ -256,6 +273,12 @@ async function embedWithMinimax(
       throw new EmbeddingRateLimitError(
         `MiniMax embeddings failed: ${message}`,
         getMinimaxRetryAfterMs(response.headers),
+        {
+          provider: 'minimax',
+          traceId: response.headers.get('trace-id') || undefined,
+          requestId: response.headers.get('minimax-request-id') || undefined,
+          statusCode,
+        },
       );
     }
     throw new Error(`MiniMax embeddings failed: ${message}`);
@@ -334,3 +357,8 @@ function sleep(ms: number): Promise<void> {
 export const EMBEDDING_MODEL = () => getEmbeddingConfig().model;
 export const EMBEDDING_DIMENSIONS = () => getEmbeddingConfig().dimensions;
 export { hasEmbeddingProvider };
+export { EmbeddingRateLimitError };
+
+export function isEmbeddingRateLimitError(error: unknown): error is EmbeddingRateLimitError {
+  return error instanceof EmbeddingRateLimitError;
+}

@@ -333,15 +333,20 @@ async function handleCliOnly(command: string, args: string[]) {
     // --fast skips DB checks entirely.
     const { runDoctor } = await import('./commands/doctor.ts');
     if (args.includes('--fast')) {
-      await runDoctor(null, args);
+      process.exit(await runDoctor(null, args));
     } else {
       try {
         const eng = await connectEngine();
-        await runDoctor(eng, args);
-        await eng.disconnect();
+        let exitCode: number;
+        try {
+          exitCode = await runDoctor(eng, args);
+        } finally {
+          await eng.disconnect();
+        }
+        process.exit(exitCode);
       } catch {
         // DB unavailable — still run filesystem checks
-        await runDoctor(null, args);
+        process.exit(await runDoctor(null, args));
       }
     }
     return;

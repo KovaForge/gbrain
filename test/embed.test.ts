@@ -8,18 +8,32 @@ let activeEmbedCalls = 0;
 let maxConcurrentEmbedCalls = 0;
 let totalEmbedCalls = 0;
 
+class MockEmbeddingRateLimitError extends Error {
+  provider?: string;
+
+  constructor(message: string, provider = 'minimax') {
+    super(message);
+    this.name = 'EmbeddingRateLimitError';
+    this.provider = provider;
+  }
+}
+
+let embedBatchImpl = async (texts: string[]) => {
+  activeEmbedCalls++;
+  totalEmbedCalls++;
+  if (activeEmbedCalls > maxConcurrentEmbedCalls) {
+    maxConcurrentEmbedCalls = activeEmbedCalls;
+  }
+  // Simulate API latency so concurrent workers actually overlap.
+  await new Promise(r => setTimeout(r, 30));
+  activeEmbedCalls--;
+  return texts.map(() => new Float32Array(1536));
+};
+
 mock.module('../src/core/embedding.ts', () => ({
-  embedBatch: async (texts: string[]) => {
-    activeEmbedCalls++;
-    totalEmbedCalls++;
-    if (activeEmbedCalls > maxConcurrentEmbedCalls) {
-      maxConcurrentEmbedCalls = activeEmbedCalls;
-    }
-    await new Promise(r => setTimeout(r, 30));
-    activeEmbedCalls--;
-    return texts.map(() => new Float32Array(1536));
-  },
+  embedBatch: async (texts: string[]) => embedBatchImpl(texts),
   getEmbeddingModel: () => 'embo-01',
+  isEmbeddingRateLimitError: (error: unknown) => error instanceof MockEmbeddingRateLimitError,
 }));
 
 const { runEmbed } = await import('../src/commands/embed.ts');
@@ -45,6 +59,17 @@ beforeEach(() => {
   activeEmbedCalls = 0;
   maxConcurrentEmbedCalls = 0;
   totalEmbedCalls = 0;
+  embedBatchImpl = async (texts: string[]) => {
+    activeEmbedCalls++;
+    totalEmbedCalls++;
+    if (activeEmbedCalls > maxConcurrentEmbedCalls) {
+      maxConcurrentEmbedCalls = activeEmbedCalls;
+    }
+    // Simulate API latency so concurrent workers actually overlap.
+    await new Promise(r => setTimeout(r, 30));
+    activeEmbedCalls--;
+    return texts.map(() => new Float32Array(1536));
+  };
 });
 
 afterEach(() => {
@@ -144,6 +169,54 @@ describe('runEmbed --all (parallel)', () => {
 
     expect(totalEmbedCalls).toBe(5);
     expect(maxConcurrentEmbedCalls).toBe(1);
+  });
+
+  test('defaults to serial embedding for MiniMax', async () => {
+    const pages = Array.from({ length: 5 }, (_, i) => ({ slug: `page-${i}` }));
+    const chunksBySlug = new Map(
+      pages.map(p => [
+        p.slug,
+        [{ chunk_index: 0, chunk_text: `text ${p.slug}`, chunk_source: 'compiled_truth', embedded_at: null, token_count: 4 }],
+      ]),
+    );
+
+    const engine = mockEngine({
+      listPages: async () => pages,
+      getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
+      upsertChunks: async () => {},
+    });
+
+    process.env.MINIMAX_API_KEY = 'test-key';
+
+    await runEmbed(engine, ['--all']);
+
+    expect(totalEmbedCalls).toBe(5);
+    expect(maxConcurrentEmbedCalls).toBe(1);
+  });
+
+  test('aborts embed --all after provider-wide rate limit', async () => {
+    const pages = Array.from({ length: 5 }, (_, i) => ({ slug: `page-${i}` }));
+    const chunksBySlug = new Map(
+      pages.map(p => [
+        p.slug,
+        [{ chunk_index: 0, chunk_text: `text ${p.slug}`, chunk_source: 'compiled_truth', embedded_at: null, token_count: 4 }],
+      ]),
+    );
+
+    const engine = mockEngine({
+      listPages: async () => pages,
+      getChunks: async (slug: string) => chunksBySlug.get(slug) || [],
+      upsertChunks: async () => {},
+    });
+
+    process.env.MINIMAX_API_KEY = 'test-key';
+    embedBatchImpl = async () => {
+      totalEmbedCalls++;
+      throw new MockEmbeddingRateLimitError('MiniMax embeddings failed: rate limit exceeded(RPM)');
+    };
+
+    await expect(runEmbed(engine, ['--all'])).rejects.toThrow(/Embedding aborted: minimax is currently rate-limiting/i);
+    expect(totalEmbedCalls).toBe(1);
   });
 
   test('skips pages whose chunks are all already embedded when --stale', async () => {
