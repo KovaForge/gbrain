@@ -147,7 +147,22 @@ export async function embed(text: string): Promise<Float32Array> {
   return result[0];
 }
 
-export async function embedBatch(texts: string[], kind: EmbeddingKind = 'document'): Promise<Float32Array[]> {
+export interface EmbedBatchOptions {
+  /** Query/document mode for providers that distinguish embedding tasks. */
+  kind?: EmbeddingKind;
+  /**
+   * Optional callback fired after each sub-batch completes. CLI wrappers tick
+   * a reporter; Minion handlers can update durable job progress here.
+   */
+  onBatchComplete?: (done: number, total: number) => void;
+}
+
+export async function embedBatch(
+  texts: string[],
+  options: EmbedBatchOptions | EmbeddingKind = {},
+): Promise<Float32Array[]> {
+  const opts: EmbedBatchOptions = typeof options === 'string' ? { kind: options } : options;
+  const kind = opts.kind ?? 'document';
   const truncated = texts.map(t => t.slice(0, MAX_CHARS));
   const results: Float32Array[] = [];
   const batchSize = getBatchSize();
@@ -156,6 +171,7 @@ export async function embedBatch(texts: string[], kind: EmbeddingKind = 'documen
     const batch = truncated.slice(i, i + batchSize);
     const batchResults = await embedBatchWithRetry(batch, kind);
     results.push(...batchResults);
+    opts.onBatchComplete?.(results.length, truncated.length);
   }
 
   return results;
@@ -361,4 +377,21 @@ export { EmbeddingRateLimitError };
 
 export function isEmbeddingRateLimitError(error: unknown): error is EmbeddingRateLimitError {
   return error instanceof EmbeddingRateLimitError;
+}
+
+/**
+ * v0.20.0 Cathedral II Layer 8 (D1): USD cost per 1k tokens for
+ * text-embedding-3-large. Used by `gbrain sync --all` cost preview and
+ * the reindex-code backfill command to surface expected spend before
+ * the agent/user accepts an expensive operation.
+ *
+ * Value: $0.00013 / 1k tokens as of 2026. Update when OpenAI changes
+ * pricing. Single source of truth — every cost-preview surface reads
+ * this constant, so a pricing change is a one-line edit.
+ */
+export const EMBEDDING_COST_PER_1K_TOKENS = 0.00013;
+
+/** Compute USD cost estimate for embedding `tokens` at current model rate. */
+export function estimateEmbeddingCostUsd(tokens: number): number {
+  return (tokens / 1000) * EMBEDDING_COST_PER_1K_TOKENS;
 }
