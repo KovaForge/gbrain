@@ -1,6 +1,7 @@
 import { describe, test, expect, mock, beforeAll, afterAll } from 'bun:test';
 import { writeFileSync, mkdirSync, rmSync, symlinkSync } from 'fs';
 import { join } from 'path';
+import type { BrainEngine } from '../src/core/engine.ts';
 mock.module('../src/core/embedding.ts', () => ({
   embedBatch: async (texts: string[]) => texts.map(() => new Float32Array(1536)),
   getEmbeddingModel: () => 'embo-01',

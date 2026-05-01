@@ -189,7 +189,7 @@ async function embedBatchWithRetry(texts: string[], kind: EmbeddingKind): Promis
         const response = await getClient().embeddings.create({
           model: cfg.model,
           input: texts,
-          ...(cfg.dimensions && cfg.provider !== 'minimax' ? { dimensions: cfg.dimensions } : {}),
+          ...(cfg.dimensions ? { dimensions: cfg.dimensions } : {}),
         });
 
         const sorted = response.data.sort((a, b) => a.index - b.index);
@@ -270,7 +270,7 @@ async function embedWithMinimax(
   const response = await fetch(url, {
     method: 'POST',
     headers: {
-      Authorization: cfg.apiKey,
+      Authorization: cfg.apiKey || '',
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({

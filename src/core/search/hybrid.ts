@@ -281,15 +281,12 @@ async function cosineReScore(
 }
 
 
-function applyBacklinkBoost(results: SearchResult[], backlinkCounts: Map<string, number>): void {
+export function applyBacklinkBoost(results: SearchResult[], backlinkCounts: Map<string, number>): void {
   if (backlinkCounts.size === 0) return;
-  const maxBacklinks = Math.max(...backlinkCounts.values());
-  if (maxBacklinks <= 0) return;
-
   for (const result of results) {
     const count = backlinkCounts.get(result.slug) ?? 0;
     if (count <= 0) continue;
-    const boost = 1 + Math.min(0.25, (count / maxBacklinks) * 0.25);
+    const boost = 1 + 0.05 * Math.log(1 + count);
     result.score *= boost;
   }
 }

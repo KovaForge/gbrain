@@ -45,7 +45,7 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
   // message promised this flag exists.
   if (locksMode) {
     await runLocksCheck(engine, jsonOutput);
-    return;
+    return 0;
   }
 
   const checks: Check[] = [];

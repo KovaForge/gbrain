@@ -113,7 +113,7 @@ describe('runEmbed metadata', () => {
     try {
       await runEmbed(engine, ['page-1']);
       expect(upserted).toBeTruthy();
-      expect(upserted?.[0].model).toBe('embo-01');
+      expect((upserted as unknown as any[])[0].model).toBe('embo-01');
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;

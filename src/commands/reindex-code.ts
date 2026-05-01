@@ -26,7 +26,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { importCodeFile } from '../core/import-file.ts';
 import { estimateTokens } from '../core/chunkers/code.ts';
-import { EMBEDDING_MODEL, estimateEmbeddingCostUsd } from '../core/embedding.ts';
+import { getEmbeddingModel, estimateEmbeddingCostUsd } from '../core/embedding.ts';
 import { errorFor, serializeError } from '../core/errors.ts';
 import { createInterface } from 'readline';
 import { createProgress } from '../core/progress.ts';
@@ -147,7 +147,7 @@ export async function runReindexCode(
       failed: 0,
       totalTokens,
       costUsd,
-      model: EMBEDDING_MODEL,
+      model: getEmbeddingModel(),
     };
   }
 
@@ -160,7 +160,7 @@ export async function runReindexCode(
       failed: 0,
       totalTokens: 0,
       costUsd: 0,
-      model: EMBEDDING_MODEL,
+      model: getEmbeddingModel(),
     };
   }
 
@@ -229,7 +229,7 @@ export async function runReindexCode(
     failed,
     totalTokens,
     costUsd,
-    model: EMBEDDING_MODEL,
+    model: getEmbeddingModel(),
     failures: failures.length > 0 ? failures : undefined,
   };
 }
@@ -270,11 +270,11 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
     const previewMsg =
       `reindex-code: ${preview.totalPages} code page(s), ` +
       `~${preview.totalTokens.toLocaleString()} tokens, ` +
-      `est. $${costUsd.toFixed(2)} on ${EMBEDDING_MODEL}.`;
+      `est. $${costUsd.toFixed(2)} on ${getEmbeddingModel()}.`;
 
     if (preview.totalPages === 0) {
       if (json) {
-        console.log(JSON.stringify({ status: 'ok', codePages: 0, reindexed: 0, skipped: 0, failed: 0, totalTokens: 0, costUsd: 0, model: EMBEDDING_MODEL }));
+        console.log(JSON.stringify({ status: 'ok', codePages: 0, reindexed: 0, skipped: 0, failed: 0, totalTokens: 0, costUsd: 0, model: getEmbeddingModel() }));
       } else {
         console.log('No code pages to reindex.');
       }
@@ -290,7 +290,7 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
           message: previewMsg,
           hint: 'Pass --yes to proceed, or --dry-run to see the preview and exit 0.',
         }));
-        console.log(JSON.stringify({ error: envelope, preview, costUsd, model: EMBEDDING_MODEL }));
+        console.log(JSON.stringify({ error: envelope, preview, costUsd, model: getEmbeddingModel() }));
         process.exit(2);
       }
       console.log(previewMsg);

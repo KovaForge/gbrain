@@ -1,5 +1,5 @@
 import type { BrainEngine } from '../core/engine.ts';
-import { embedBatch, isEmbeddingRateLimitError } from '../core/embedding.ts';
+import { embedBatch, getEmbeddingModel, isEmbeddingRateLimitError } from '../core/embedding.ts';
 import { loadEmbeddingProviderConfig } from '../core/provider-config.ts';
 import type { ChunkInput } from '../core/types.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
@@ -134,8 +134,7 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
     return result;
   } catch (e) {
     if (progressStarted) progress.finish();
-    console.error(e instanceof Error ? e.message : String(e));
-    process.exit(1);
+    throw e;
   }
 }
 
@@ -208,6 +207,7 @@ async function embedPage(
     chunk_text: c.chunk_text,
     chunk_source: c.chunk_source,
     embedding: embeddingMap.get(c.chunk_index),
+    model: embeddingMap.has(c.chunk_index) ? getEmbeddingModel() : c.model ?? undefined,
     token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
   }));
 
@@ -291,6 +291,7 @@ async function embedAll(
         chunk_text: c.chunk_text,
         chunk_source: c.chunk_source,
         embedding: embeddingMap.get(c.chunk_index) ?? undefined,
+        model: embeddingMap.has(c.chunk_index) ? getEmbeddingModel() : c.model ?? undefined,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
       await engine.upsertChunks(page.slug, updated);
@@ -427,6 +428,7 @@ async function embedAllStale(
         // For stale chunks: pass the new embedding.
         // For non-stale chunks: pass undefined → COALESCE preserves existing embedding.
         embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
+        model: staleIdxToEmbedding.has(c.chunk_index) ? getEmbeddingModel() : c.model ?? undefined,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
       await engine.upsertChunks(slug, merged);
