@@ -1,393 +1,80 @@
 /**
- * Embedding Service
- * Ported from production Ruby implementation (embedding_service.rb, 190 LOC)
+ * Embedding Service — v0.14+ thin delegation to src/core/ai/gateway.ts.
  *
- * Default provider is OpenAI text-embedding-3-large at 1536 dimensions.
- * Supports provider/base-url/model overrides for MiniMax and OpenAI-compatible APIs.
- * Retry with exponential backoff (4s base, 120s cap, 5 retries).
- * 8000 character input truncation.
+ * The gateway handles provider resolution, retry, error normalization, and
+ * dimension-parameter passthrough (preserving existing 1536-dim brains).
  */
 
-import OpenAI from 'openai';
-import { loadConfig, type EmbeddingProvider } from './config.ts';
-import type { EmbeddingProviderConfig } from './provider-config.ts';
-import { hasEmbeddingProvider, loadEmbeddingProviderConfig } from './provider-config.ts';
+import {
+  embed as gatewayEmbed,
+  embedOne as gatewayEmbedOne,
+  getEmbeddingModel as gatewayGetModel,
+  getEmbeddingDimensions as gatewayGetDims,
+} from './ai/gateway.ts';
 
-const OPENAI_MODEL = 'text-embedding-3-large';
-const MINIMAX_MODEL = 'embo-01';
-const DEFAULT_EMBEDDING_DIMENSIONS = 1536;
-const MAX_CHARS = 8000;
-const MAX_RETRIES = 5;
-const BASE_DELAY_MS = 4000;
-const MAX_DELAY_MS = 120000;
-const DEFAULT_BATCH_SIZE = 100;
-const DEFAULT_MINIMAX_REQUEST_INTERVAL_MS = 6500;
+// v0.27.1: re-export multimodal embedding so callers can pull both text and
+// image embedding APIs from `src/core/embedding`. import-image-file consumes
+// embedMultimodal directly.
+export { embedMultimodal } from './ai/gateway.ts';
+export type { MultimodalInput } from './ai/types.ts';
 
-type EmbeddingKind = 'document' | 'query';
-type MinimaxVector = number[] | { embedding?: number[]; vector?: number[]; values?: number[]; index?: number };
-type MinimaxEmbeddingResponse = {
-  vectors?: MinimaxVector[] | null;
-  total_tokens?: number;
-  base_resp?: {
-    status_code?: number;
-    status_msg?: string;
-  };
-};
-
-let client: OpenAI | null = null;
-let openaiClient: OpenAI | null = null;
-let openaiClientApiKey: string | undefined;
-let minimaxNextRequestAt = 0;
-
-interface EmbeddingConfig {
-  provider: EmbeddingProvider;
-  model: string;
-  dimensions: number;
-  apiKey?: string;
-  groupId?: string;
-  baseUrl?: string;
-}
-
-class EmbeddingRateLimitError extends Error {
-  retryAfterMs: number;
-  provider?: string;
-  traceId?: string;
-  requestId?: string;
-  statusCode?: number;
-
-  constructor(
-    message: string,
-    retryAfterMs: number,
-    opts?: {
-      provider?: string;
-      traceId?: string;
-      requestId?: string;
-      statusCode?: number;
-    },
-  ) {
-    super(message);
-    this.name = 'EmbeddingRateLimitError';
-    this.retryAfterMs = retryAfterMs;
-    this.provider = opts?.provider;
-    this.traceId = opts?.traceId;
-    this.requestId = opts?.requestId;
-    this.statusCode = opts?.statusCode;
-  }
-}
-
-function getClient(): OpenAI {
-  if (!client) {
-    const cfg = loadEmbeddingProviderConfig();
-    if (!cfg?.apiKey) {
-      throw new Error('No embedding provider configured. Set OPENAI_API_KEY or MINIMAX_API_KEY.');
-    }
-    client = new OpenAI({
-      apiKey: cfg.apiKey,
-      ...(cfg.baseURL ? { baseURL: cfg.baseURL } : {}),
-    });
-  }
-  return client;
-}
-
-function getOpenAIClient(apiKey?: string): OpenAI {
-  if (!openaiClient || openaiClientApiKey != apiKey) {
-    openaiClient = new OpenAI(apiKey ? { apiKey } : undefined);
-    openaiClientApiKey = apiKey;
-  }
-  return openaiClient;
-}
-
-function getEmbeddingConfig(): EmbeddingConfig {
-  const config = loadConfig();
-  const provider = (config?.embedding_provider || 'openai') as EmbeddingProvider;
-
-  if (provider === 'minimax') {
-    return {
-      provider,
-      model: config?.embedding_model || MINIMAX_MODEL,
-      dimensions: config?.embedding_dimensions || DEFAULT_EMBEDDING_DIMENSIONS,
-      apiKey: config?.minimax_api_key,
-      groupId: config?.minimax_group_id,
-      baseUrl: config?.minimax_base_url || config?.embedding_base_url || 'https://api.minimax.chat/v1',
-    };
-  }
-
-  return {
-    provider: 'openai',
-    model: config?.embedding_model || OPENAI_MODEL,
-    dimensions: config?.embedding_dimensions || DEFAULT_EMBEDDING_DIMENSIONS,
-    apiKey: config?.openai_api_key,
-    baseUrl: config?.embedding_base_url,
-  };
-}
-
-export function getEmbeddingProvider(): EmbeddingProvider {
-  return getEmbeddingConfig().provider;
-}
-
-export function getEmbeddingModel(): string {
-  return getEmbeddingConfig().model;
-}
-
-export function getEmbeddingDimensions(): number {
-  return getEmbeddingConfig().dimensions;
-}
-
-export function hasEmbeddingProviderCredentials(): boolean {
-  const config = getEmbeddingConfig();
-  if (config.provider === 'minimax') {
-    return Boolean(config.apiKey && config.groupId);
-  }
-  return Boolean(config.apiKey);
-}
-
+/** Embed one text. */
 export async function embed(text: string): Promise<Float32Array> {
-  const truncated = text.slice(0, MAX_CHARS);
-  const result = await embedBatch([truncated], 'query');
-  return result[0];
+  return gatewayEmbedOne(text);
 }
 
 export interface EmbedBatchOptions {
-  /** Query/document mode for providers that distinguish embedding tasks. */
-  kind?: EmbeddingKind;
   /**
-   * Optional callback fired after each sub-batch completes. CLI wrappers tick
-   * a reporter; Minion handlers can update durable job progress here.
+   * Optional callback fired after each sub-batch completes. CLI wrappers
+   * tick a reporter; Minion handlers can call job.updateProgress here.
    */
   onBatchComplete?: (done: number, total: number) => void;
 }
 
+/**
+ * Embed a batch of texts via the gateway. Sub-batches of 100 so upstream
+ * progress callbacks fire incrementally on large imports. The gateway owns
+ * adaptive batch splitting and per-recipe token-budget logic; this paginator
+ * is purely about progress-callback granularity.
+ */
+const BATCH_SIZE = 100;
 export async function embedBatch(
   texts: string[],
-  options: EmbedBatchOptions | EmbeddingKind = {},
+  options: EmbedBatchOptions = {},
 ): Promise<Float32Array[]> {
-  const opts: EmbedBatchOptions = typeof options === 'string' ? { kind: options } : options;
-  const kind = opts.kind ?? 'document';
-  const truncated = texts.map(t => t.slice(0, MAX_CHARS));
-  const results: Float32Array[] = [];
-  const batchSize = getBatchSize();
-
-  for (let i = 0; i < truncated.length; i += batchSize) {
-    const batch = truncated.slice(i, i + batchSize);
-    const batchResults = await embedBatchWithRetry(batch, kind);
-    results.push(...batchResults);
-    opts.onBatchComplete?.(results.length, truncated.length);
+  if (!texts || texts.length === 0) return [];
+  // Fast path: small batch, no progress callback — single gateway call.
+  if (texts.length <= BATCH_SIZE && !options.onBatchComplete) {
+    return gatewayEmbed(texts);
   }
-
+  const results: Float32Array[] = [];
+  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    const slice = texts.slice(i, i + BATCH_SIZE);
+    const out = await gatewayEmbed(slice);
+    results.push(...out);
+    options.onBatchComplete?.(results.length, texts.length);
+  }
   return results;
 }
 
-async function embedBatchWithRetry(texts: string[], kind: EmbeddingKind): Promise<Float32Array[]> {
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      const cfg = loadEmbeddingProviderConfig();
-      if (cfg?.apiKey) {
-        if (cfg.provider === 'minimax') {
-          return await embedWithMinimax(cfg, texts, kind);
-        }
-
-        const response = await getClient().embeddings.create({
-          model: cfg.model,
-          input: texts,
-          ...(cfg.dimensions ? { dimensions: cfg.dimensions } : {}),
-        });
-
-        const sorted = response.data.sort((a, b) => a.index - b.index);
-        return sorted.map(d => new Float32Array(d.embedding));
-      }
-
-      const config = getEmbeddingConfig();
-      if (!config.apiKey) {
-        throw new Error(`Missing API key for embedding provider: ${config.provider}`);
-      }
-
-      if (config.provider === 'minimax') {
-        return await createMiniMaxEmbeddings(texts, kind, config);
-      }
-      return await createOpenAIEmbeddings(texts, config);
-    } catch (e: unknown) {
-      if (attempt === MAX_RETRIES - 1) throw e;
-
-      let delay = exponentialDelay(attempt);
-
-      if (e instanceof EmbeddingRateLimitError) {
-        delay = Math.max(delay, e.retryAfterMs);
-      }
-
-      if (e instanceof OpenAI.APIError && e.status === 429) {
-        const retryAfter = e.headers?.['retry-after'];
-        if (retryAfter) {
-          const parsed = parseInt(retryAfter, 10);
-          if (!isNaN(parsed)) {
-            delay = parsed * 1000;
-          }
-        }
-      }
-
-      await sleep(delay);
-    }
-  }
-
-  throw new Error('Embedding failed after all retries');
+/** Currently-configured embedding model (short form without provider prefix). */
+export function getEmbeddingModelName(): string {
+  return gatewayGetModel().split(':').slice(1).join(':') || 'text-embedding-3-large';
 }
 
-async function createOpenAIEmbeddings(texts: string[], config: EmbeddingConfig): Promise<Float32Array[]> {
-  const client = config.baseUrl
-    ? new OpenAI({ apiKey: config.apiKey, baseURL: config.baseUrl })
-    : getOpenAIClient(config.apiKey);
-  const response = await client.embeddings.create({
-    model: config.model,
-    input: texts,
-    dimensions: config.dimensions,
-  });
-
-  const sorted = response.data.sort((a, b) => a.index - b.index);
-  return sorted.map(d => new Float32Array(d.embedding));
+/** Currently-configured embedding dimensions. */
+export function getEmbeddingDimensions(): number {
+  return gatewayGetDims();
 }
 
-async function createMiniMaxEmbeddings(texts: string[], kind: EmbeddingKind, config: EmbeddingConfig): Promise<Float32Array[]> {
-  const cfg: EmbeddingProviderConfig = {
-    provider: 'minimax',
-    apiKey: config.apiKey || '',
-    model: config.model,
-    baseURL: config.baseUrl,
-    dimensions: config.dimensions,
-    groupId: config.groupId,
-  } as EmbeddingProviderConfig & { groupId?: string };
-  return embedWithMinimax(cfg, texts, kind);
-}
-
-async function embedWithMinimax(
-  cfg: EmbeddingProviderConfig,
-  texts: string[],
-  kind: EmbeddingKind,
-): Promise<Float32Array[]> {
-  await waitForMinimaxRequestSlot();
-
-  const baseURL = (cfg.baseURL || 'https://api.minimax.chat/v1').replace(/\/$/, '');
-  const groupId = (cfg as EmbeddingProviderConfig & { groupId?: string }).groupId;
-  const url = groupId ? `${baseURL}/embeddings?GroupId=${encodeURIComponent(groupId)}` : `${baseURL}/embeddings`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: cfg.apiKey || '',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: cfg.model,
-      texts,
-      type: kind === 'query' ? 'query' : 'db',
-      ...(cfg.dimensions && cfg.provider !== 'minimax' ? { dimensions: cfg.dimensions } : {}),
-    }),
-  });
-
-  const payload = await response.json() as MinimaxEmbeddingResponse;
-  const statusCode = payload.base_resp?.status_code ?? (response.ok ? 0 : response.status);
-  if (!response.ok || statusCode !== 0) {
-    const message = payload.base_resp?.status_msg || response.statusText || 'unknown error';
-    if (statusCode === 1002 || /rate limit/i.test(message)) {
-      throw new EmbeddingRateLimitError(
-        `MiniMax embeddings failed: ${message}`,
-        getMinimaxRetryAfterMs(response.headers),
-        {
-          provider: 'minimax',
-          traceId: response.headers.get('trace-id') || undefined,
-          requestId: response.headers.get('minimax-request-id') || undefined,
-          statusCode,
-        },
-      );
-    }
-    throw new Error(`MiniMax embeddings failed: ${message}`);
-  }
-
-  const vectors = normalizeMinimaxVectors(payload.vectors, texts.length);
-  return vectors.map(v => new Float32Array(v));
-}
-
-function normalizeMinimaxVectors(vectors: MinimaxEmbeddingResponse['vectors'], expected: number): number[][] {
-  if (!Array.isArray(vectors)) {
-    throw new Error('MiniMax embeddings response did not include vectors');
-  }
-
-  const normalized = vectors.map((item, position) => {
-    if (Array.isArray(item)) {
-      return { index: position, embedding: item };
-    }
-
-    const embedding = item.embedding || item.vector || item.values;
-    if (!Array.isArray(embedding)) {
-      throw new Error('MiniMax embeddings response contained a vector in an unknown format');
-    }
-
-    return {
-      index: typeof item.index === 'number' ? item.index : position,
-      embedding,
-    };
-  }).sort((a, b) => a.index - b.index);
-
-  if (normalized.length !== expected) {
-    throw new Error(`MiniMax embeddings response count mismatch: expected ${expected}, got ${normalized.length}`);
-  }
-
-  return normalized.map(item => item.embedding);
-}
-
-function getBatchSize(): number {
-  const configured = parseInt(process.env.GBRAIN_EMBED_BATCH_SIZE || '', 10);
-  if (Number.isFinite(configured) && configured > 0) {
-    return configured;
-  }
-
-  const provider = loadEmbeddingProviderConfig()?.provider || getEmbeddingConfig().provider;
-  return provider === 'minimax' ? 1 : DEFAULT_BATCH_SIZE;
-}
-
-function exponentialDelay(attempt: number): number {
-  return Math.min(BASE_DELAY_MS * (2 ** attempt), MAX_DELAY_MS);
-}
-
-function getMinimaxRetryAfterMs(headers: Headers): number {
-  const retryAfter = headers.get('retry-after');
-  if (retryAfter) {
-    const parsed = parseInt(retryAfter, 10);
-    if (!isNaN(parsed) && parsed > 0) {
-      return parsed * 1000;
-    }
-  }
-  return DEFAULT_MINIMAX_REQUEST_INTERVAL_MS;
-}
-
-async function waitForMinimaxRequestSlot(): Promise<void> {
-  const now = Date.now();
-  const delay = minimaxNextRequestAt - now;
-  if (delay > 0) {
-    await sleep(delay);
-  }
-  minimaxNextRequestAt = Date.now() + DEFAULT_MINIMAX_REQUEST_INTERVAL_MS;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-export const EMBEDDING_MODEL = () => getEmbeddingConfig().model;
-export const EMBEDDING_DIMENSIONS = () => getEmbeddingConfig().dimensions;
-export { hasEmbeddingProvider };
-export { EmbeddingRateLimitError };
-
-export function isEmbeddingRateLimitError(error: unknown): error is EmbeddingRateLimitError {
-  return error instanceof EmbeddingRateLimitError;
-}
+// Back-compat exports for tests that imported these from v0.13.
+export const EMBEDDING_MODEL = 'text-embedding-3-large';
+export const EMBEDDING_DIMENSIONS = 1536;
 
 /**
- * v0.20.0 Cathedral II Layer 8 (D1): USD cost per 1k tokens for
- * text-embedding-3-large. Used by `gbrain sync --all` cost preview and
- * the reindex-code backfill command to surface expected spend before
- * the agent/user accepts an expensive operation.
- *
- * Value: $0.00013 / 1k tokens as of 2026. Update when OpenAI changes
- * pricing. Single source of truth — every cost-preview surface reads
- * this constant, so a pricing change is a one-line edit.
+ * USD cost per 1k tokens for text-embedding-3-large. Used by
+ * `gbrain sync --all` cost preview and `reindex-code` to surface
+ * expected spend before accepting expensive operations.
  */
 export const EMBEDDING_COST_PER_1K_TOKENS = 0.00013;
 

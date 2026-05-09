@@ -26,6 +26,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import type { MinionJobContext, MinionJob } from '../types.ts';
+import { UnrecoverableError } from '../types.ts';
 import type {
   ContentBlock,
   SubagentHandlerData,
@@ -149,13 +150,16 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     const systemPrompt = data.system ?? DEFAULT_SYSTEM;
 
     // Build the tool registry bound to THIS job as the owning subagent.
-    // allowed_slug_prefixes (v0.23) flows through buildBrainTools → the
-    // put_page schema description AND the OperationContext, so the model's
-    // tool schema and the server-side check stay in sync.
+    // brain_id (per-call brain override; children inherit parent's unless
+    // they set their own) and allowed_slug_prefixes (v0.23 trusted-workspace
+    // allow-list — flows through buildBrainTools → the put_page schema
+    // description AND the OperationContext, so the model's tool schema and
+    // the server-side check stay in sync).
     const registry = deps.toolRegistry ?? buildBrainTools({
       subagentId: ctx.id,
       engine,
       config,
+      brainId: data.brain_id,
       allowedSlugPrefixes: data.allowed_slug_prefixes,
     });
     const toolDefs = data.allowed_tools && data.allowed_tools.length > 0
@@ -349,6 +353,15 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       } catch (err) {
         // Release lease eagerly on error so we don't starve capacity.
         await releaseLease(engine, lease.leaseId!).catch(() => {});
+        // Terminal classification: a 400 "prompt is too long" from Anthropic
+        // is unrecoverable — retrying with the same prompt will always fail.
+        // Convert to UnrecoverableError so the worker routes the job
+        // straight to `dead`, bypassing max_stalled retries (the v0.30.x
+        // dream-cycle queue-clog the chunking work was built to prevent).
+        if (isPromptTooLongError(err)) {
+          const origMsg = err instanceof Error ? err.message : String(err);
+          throw new UnrecoverableError(`prompt_too_long: ${origMsg}`);
+        }
         throw err;
       }
 
@@ -698,6 +711,43 @@ export class RateLeaseUnavailableError extends Error {
     super(`rate lease "${key}" full (${active}/${max})`);
     this.name = 'RateLeaseUnavailableError';
   }
+}
+
+/**
+ * Detect Anthropic SDK errors that indicate the input prompt exceeded the
+ * model's context window. Two recognized shapes:
+ *   - `Anthropic.APIError` with `.status === 400` and message containing
+ *     "prompt is too long" (current SDK wording, observed in production
+ *     as `prompt is too long: 1707509 tokens > 1000000 maximum`).
+ *   - Any error whose message includes "prompt is too long" (defensive
+ *     against SDK-wrap shape changes).
+ *
+ * Case-insensitive on the phrase. Also matches `request_too_large` and
+ * `invalid_request_error` types when accompanied by the same message.
+ *
+ * Exported for unit testing.
+ */
+export function isPromptTooLongError(err: unknown): boolean {
+  if (!err) return false;
+  // Walk both `.message` and `.error?.message` shapes.
+  const msg = (err as { message?: unknown })?.message;
+  const inner = (err as { error?: { message?: unknown } })?.error?.message;
+  const candidates = [msg, inner].filter((s): s is string => typeof s === 'string');
+  for (const c of candidates) {
+    if (/prompt is too long/i.test(c)) return true;
+  }
+  // Anthropic SDK wraps with .status; 400 + 'invalid_request_error' /
+  // 'request_too_large' types both indicate the same class. Only treat
+  // as terminal when the message actually says prompt-too-long; broader
+  // 400s could be transient (e.g., malformed JSON from a test stub).
+  const status = (err as { status?: unknown })?.status;
+  const errType = (err as { error?: { type?: unknown } })?.error?.type;
+  if (status === 400 && (errType === 'invalid_request_error' || errType === 'request_too_large')) {
+    for (const c of candidates) {
+      if (/too long|exceed|maximum/i.test(c)) return true;
+    }
+  }
+  return false;
 }
 
 // ── Testing surface ─────────────────────────────────────────

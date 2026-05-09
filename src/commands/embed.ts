@@ -1,6 +1,5 @@
 import type { BrainEngine } from '../core/engine.ts';
-import { embedBatch, getEmbeddingModel, isEmbeddingRateLimitError } from '../core/embedding.ts';
-import { loadEmbeddingProviderConfig } from '../core/provider-config.ts';
+import { embedBatch } from '../core/embedding.ts';
 import type { ChunkInput } from '../core/types.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 import { createProgress, type ProgressReporter } from '../core/progress.ts';
@@ -76,9 +75,6 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
       try {
         await embedPage(engine, s, !!opts.dryRun, result);
       } catch (e: unknown) {
-        if (isEmbeddingRateLimitError(e)) {
-          throw new Error(formatEmbeddingRateLimitAbortMessage(e));
-        }
         console.error(`  Error embedding ${s}: ${e instanceof Error ? e.message : e}`);
       }
     }
@@ -134,7 +130,8 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
     return result;
   } catch (e) {
     if (progressStarted) progress.finish();
-    throw e;
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exit(1);
   }
 }
 
@@ -207,7 +204,6 @@ async function embedPage(
     chunk_text: c.chunk_text,
     chunk_source: c.chunk_source,
     embedding: embeddingMap.get(c.chunk_index),
-    model: embeddingMap.has(c.chunk_index) ? getEmbeddingModel() : c.model ?? undefined,
     token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
   }));
 
@@ -243,7 +239,6 @@ async function embedAll(
 
   const pages = await engine.listPages({ limit: 100000 });
   let processed = 0;
-  let abortReason: string | null = null;
 
   // Concurrency limit for parallel page embedding.
   // Each worker pulls pages from a shared queue and makes independent
@@ -253,10 +248,9 @@ async function embedAll(
   // (3000+/min for tier 1 = 50+/sec, 20 parallel is safely below) and
   // avoids overwhelming postgres connection pools. Users can tune via
   // GBRAIN_EMBED_CONCURRENCY env var based on their tier/infra.
-  const CONCURRENCY = getEmbedConcurrency();
+  const CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
 
   async function embedOnePage(page: typeof pages[number]) {
-    if (abortReason) return;
     const chunks = await engine.getChunks(page.slug);
     const toEmbed = chunks; // staleOnly path handled above via embedAllStale
 
@@ -291,16 +285,12 @@ async function embedAll(
         chunk_text: c.chunk_text,
         chunk_source: c.chunk_source,
         embedding: embeddingMap.get(c.chunk_index) ?? undefined,
-        model: embeddingMap.has(c.chunk_index) ? getEmbeddingModel() : c.model ?? undefined,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
       await engine.upsertChunks(page.slug, updated);
       result.embedded += toEmbed.length;
     } catch (e: unknown) {
       console.error(`\n  Error embedding ${page.slug}: ${e instanceof Error ? e.message : e}`);
-      if (isEmbeddingRateLimitError(e)) {
-        abortReason = formatEmbeddingRateLimitAbortMessage(e);
-      }
     }
 
     processed++;
@@ -315,7 +305,7 @@ async function embedAll(
   // don't wait for slow workers to finish an entire window.
   let nextIdx = 0;
   async function worker() {
-    while (!abortReason && nextIdx < pages.length) {
+    while (nextIdx < pages.length) {
       const idx = nextIdx++;
       await embedOnePage(pages[idx]);
     }
@@ -323,10 +313,6 @@ async function embedAll(
 
   const numWorkers = Math.min(CONCURRENCY, pages.length);
   await Promise.all(Array.from({ length: numWorkers }, () => worker()));
-
-  if (abortReason) {
-    throw new Error(abortReason);
-  }
 
   // Stdout summary preserved for scripts/tests that grep for counts.
   if (dryRun) {
@@ -402,9 +388,8 @@ async function embedAllStale(
     return;
   }
 
-  const CONCURRENCY = getEmbedConcurrency();
+  const CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
   let processed = 0;
-  let abortReason: string | null = null;
 
   async function embedOneSlug(slug: string) {
     const stale = bySlug.get(slug)!;
@@ -428,16 +413,12 @@ async function embedAllStale(
         // For stale chunks: pass the new embedding.
         // For non-stale chunks: pass undefined → COALESCE preserves existing embedding.
         embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
-        model: staleIdxToEmbedding.has(c.chunk_index) ? getEmbeddingModel() : c.model ?? undefined,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
       await engine.upsertChunks(slug, merged);
       result.embedded += stale.length;
     } catch (e: unknown) {
       console.error(`\n  Error embedding ${slug}: ${e instanceof Error ? e.message : e}`);
-      if (isEmbeddingRateLimitError(e)) {
-        abortReason = formatEmbeddingRateLimitAbortMessage(e);
-      }
     }
     processed++;
     result.pages_processed++;
@@ -446,7 +427,7 @@ async function embedAllStale(
 
   let nextIdx = 0;
   async function worker() {
-    while (!abortReason && nextIdx < slugs.length) {
+    while (nextIdx < slugs.length) {
       const idx = nextIdx++;
       await embedOneSlug(slugs[idx]);
     }
@@ -455,34 +436,5 @@ async function embedAllStale(
   const numWorkers = Math.min(CONCURRENCY, slugs.length);
   await Promise.all(Array.from({ length: numWorkers }, () => worker()));
 
-  if (abortReason) {
-    throw new Error(abortReason);
-  }
-
   console.log(`Embedded ${result.embedded} chunks across ${slugs.length} pages`);
-}
-
-
-function getEmbedConcurrency(): number {
-  const configured = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '', 10);
-  if (Number.isFinite(configured) && configured > 0) {
-    return configured;
-  }
-
-  return loadEmbeddingProviderConfig()?.provider === 'minimax' ? 1 : 20;
-}
-
-function formatEmbeddingRateLimitAbortMessage(error: {
-  message: string;
-  provider?: string;
-  traceId?: string;
-  requestId?: string;
-}): string {
-  const provider = error.provider || 'embedding provider';
-  const refs = [
-    error.traceId ? `trace-id ${error.traceId}` : null,
-    error.requestId ? `request-id ${error.requestId}` : null,
-  ].filter(Boolean).join(', ');
-  const suffix = refs ? ` (${refs})` : '';
-  return `Embedding aborted: ${provider} is currently rate-limiting this API key/account. ${error.message}${suffix}. Wait for quota reset or switch to a different embedding provider.`;
 }
