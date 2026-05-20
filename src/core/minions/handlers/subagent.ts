@@ -47,6 +47,7 @@ import {
   logSubagentSubmission,
   logSubagentHeartbeat,
 } from './subagent-audit.ts';
+import { resolveModel, isAnthropicProvider, TIER_DEFAULTS } from '../../model-config.ts';
 
 // ── Defaults ────────────────────────────────────────────────
 
@@ -145,7 +146,25 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       throw new Error('subagent job data.prompt is required (string)');
     }
 
-    const model = data.model ?? DEFAULT_MODEL;
+    // v0.31.12 subagent runtime enforcement (Layer 2 of 3 — see plan/Codex F1+F2+F13).
+    // - If `data.model` is set and non-Anthropic, reject (Layer 1 fallback if the
+    //   submit-time guard in MinionQueue.add didn't fire — defense in depth).
+    // - Otherwise route through resolveModel with tier=subagent. The resolver
+    //   warns + falls back to TIER_DEFAULTS.subagent if models.default or
+    //   models.tier.subagent resolved to non-Anthropic.
+    if (data.model && !isAnthropicProvider(data.model)) {
+      throw new Error(
+        `subagent job rejected: data.model "${data.model}" is non-Anthropic. ` +
+        `The subagent loop is Anthropic-only (Messages API + prompt caching). ` +
+        `Pass an Anthropic model id (e.g. claude-sonnet-4-6) or omit data.model to use the configured default.`,
+      );
+    }
+    const model = data.model
+      ?? await resolveModel(engine, {
+        tier: 'subagent',
+        configKey: 'models.subagent',
+        fallback: TIER_DEFAULTS.subagent,
+      });
     const maxTurns = data.max_turns ?? DEFAULT_MAX_TURNS;
     const systemPrompt = data.system ?? DEFAULT_SYSTEM;
 
@@ -630,11 +649,15 @@ async function persistToolExecPending(
   toolName: string,
   input: unknown,
 ): Promise<void> {
+  // Serialize to JSON string for the ::jsonb cast. When `input` is already a
+  // string (e.g. pre-serialized), avoid double-encoding which produces a jsonb
+  // scalar string instead of a jsonb object — breaking `input->>'key'` lookups.
+  const jsonStr = typeof input === 'string' ? input : JSON.stringify(input);
   await engine.executeRaw(
     `INSERT INTO subagent_tool_executions (job_id, message_idx, tool_use_id, tool_name, input, status)
      VALUES ($1, $2, $3, $4, $5::jsonb, 'pending')
      ON CONFLICT (job_id, tool_use_id) DO NOTHING`,
-    [jobId, messageIdx, toolUseId, toolName, JSON.stringify(input)],
+    [jobId, messageIdx, toolUseId, toolName, jsonStr],
   );
 }
 
@@ -648,7 +671,7 @@ async function persistToolExecComplete(
     `UPDATE subagent_tool_executions
         SET status = 'complete', output = $3::jsonb, ended_at = now()
       WHERE job_id = $1 AND tool_use_id = $2`,
-    [jobId, toolUseId, JSON.stringify(output)],
+    [jobId, toolUseId, typeof output === 'string' ? output : JSON.stringify(output)],
   );
 }
 
@@ -668,7 +691,7 @@ async function persistToolExecFailed(
      VALUES ($1, $2, $3, $4, $5::jsonb, 'failed', $6, now())
      ON CONFLICT (job_id, tool_use_id) DO UPDATE
        SET status = 'failed', error = EXCLUDED.error, ended_at = now()`,
-    [jobId, messageIdx, toolUseId, toolName, JSON.stringify(input), error],
+    [jobId, messageIdx, toolUseId, toolName, typeof input === 'string' ? input : JSON.stringify(input), error],
   );
 }
 

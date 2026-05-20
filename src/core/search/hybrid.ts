@@ -12,13 +12,38 @@
 import type { BrainEngine } from '../engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import type { SearchResult, SearchOpts, HybridSearchMeta } from '../types.ts';
-import { embed } from '../embedding.ts';
+import { embed, embedQuery } from '../embedding.ts';
+import { resolveEmbeddingColumn, isCacheSafe } from './embedding-column.ts';
+import { loadConfigWithEngine } from '../config.ts';
 import { dedupResults } from './dedup.ts';
-import { autoDetectDetail, classifyQuery } from './query-intent.ts';
+import { applyReranker } from './rerank.ts';
+import { autoDetectDetail, classifyQuery, isAmbiguousModalityQuery } from './query-intent.ts';
 import { expandAnchors, hydrateChunks } from './two-pass.ts';
+import { enforceTokenBudget } from './token-budget.ts';
+import { recordSearchTelemetry } from './telemetry.ts';
+import {
+  weightsForIntent,
+  effectiveRrfK,
+  applyExactMatchBoost,
+} from './intent-weights.ts';
+import {
+  SemanticQueryCache,
+  loadCacheConfig,
+} from './query-cache.ts';
 
-const RRF_K = 60;
+export const RRF_K = 60;
 const COMPILED_TRUTH_BOOST = 2.0;
+const pendingCacheWrites = new Set<Promise<unknown>>();
+
+export async function awaitPendingSearchCacheWrites(): Promise<void> {
+  if (pendingCacheWrites.size === 0) return;
+  await Promise.allSettled([...pendingCacheWrites]);
+}
+
+function trackCacheWrite(promise: Promise<unknown>): void {
+  pendingCacheWrites.add(promise);
+  promise.finally(() => pendingCacheWrites.delete(promise)).catch(() => { /* swallow */ });
+}
 /**
  * Backlink boost coefficient. Score is multiplied by (1 + BACKLINK_BOOST_COEF * log(1 + count)).
  * - 0 backlinks: factor = 1.0 (no boost).
@@ -35,14 +60,78 @@ const DEBUG = process.env.GBRAIN_SEARCH_DEBUG === '1';
  * Apply backlink boost to a result list in place. Mutates each result's score
  * by (1 + BACKLINK_BOOST_COEF * log(1 + count)). Pure data transform; no DB call.
  * Caller fetches counts via engine.getBacklinkCounts.
+ *
+ * v0.35.6.0 — floor-ratio gate. When `floorThreshold` is provided, results
+ * with `r.score < floorThreshold` are SKIPPED (no boost applied). NaN scores
+ * are also skipped (NaN < x is false in JS, which would otherwise let NaN
+ * results bypass the gate). The threshold is an ABSOLUTE score, not a ratio
+ * — compute it once at `runPostFusionStages` entry via `computeFloorThreshold`
+ * so stage order doesn't change which results clear the gate.
+ *
+ * The gate is scoped to the three metadata-axis boost stages (backlink +
+ * salience + recency). Exact-match boost (`applyExactMatchBoost` in
+ * intent-weights.ts) runs independently as a lexical-relevance signal by
+ * design.
  */
-export function applyBacklinkBoost(results: SearchResult[], counts: Map<string, number>): void {
+export function applyBacklinkBoost(
+  results: SearchResult[],
+  counts: Map<string, number>,
+  floorThreshold?: number,
+): void {
   for (const r of results) {
+    if (!Number.isFinite(r.score)) continue;
+    if (floorThreshold !== undefined && r.score < floorThreshold) continue;
     const count = counts.get(r.slug) ?? 0;
     if (count > 0) {
       r.score *= (1.0 + BACKLINK_BOOST_COEF * Math.log(1 + count));
     }
   }
+}
+
+/**
+ * v0.35.6.0 — floor-ratio threshold computation.
+ *
+ * Returns the absolute score floor below which boost stages skip a result.
+ * Returns `Number.NEGATIVE_INFINITY` (no gate) when:
+ *   - `floorRatio` is undefined (default — preserves prior behavior bit-for-bit)
+ *   - `floorRatio` is NaN, infinite, negative, or > 1 (out-of-range silently
+ *     disables the gate; range validation lives at the config-parse layer)
+ *   - No result has a positive, finite score (all-NaN, all-negative, or empty
+ *     input arrays produce no positive signal — gate stays off)
+ *
+ * Otherwise returns `topScore * floorRatio`, where `topScore` is the largest
+ * finite score in `results`. Callers compute this ONCE before any boost stage
+ * runs, then pass the resulting threshold to every stage. Single-baseline
+ * semantic — order-independent across the three metadata-axis boosts.
+ *
+ * Why this exists: gbrain's bounded boosts (`[1.0, ~1.6]` log-compressed
+ * salience clip, log-scaled backlinks, half-life recency) keep any single
+ * boost from catastrophically flipping rankings on curated small corpora.
+ * On larger corpora indexed with dense embedders (text-embedding-3-large,
+ * Voyage 3+, ZeroEntropy zembed-1), weak-overlap candidates can land in
+ * top-K via baseline vector overlap and accumulate metadata boost until
+ * they leapfrog the legitimate primary hit. The gate restricts each
+ * metadata boost to the head of the candidate pool so the long tail keeps
+ * its unboosted relevance ranking.
+ *
+ * 0.85 is a reasonable starting value for dense-embedder corpora. Default
+ * stays undefined (no gate) until per-corpus ablation evidence supports a
+ * default flip (see `TODOS.md` floor-ratio ablation entry).
+ */
+export function computeFloorThreshold(
+  results: SearchResult[],
+  floorRatio: number | undefined,
+): number {
+  if (floorRatio === undefined) return Number.NEGATIVE_INFINITY;
+  if (!Number.isFinite(floorRatio) || floorRatio < 0 || floorRatio > 1) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  let top = Number.NEGATIVE_INFINITY;
+  for (const r of results) {
+    if (Number.isFinite(r.score) && r.score > top) top = r.score;
+  }
+  if (!Number.isFinite(top) || top <= 0) return Number.NEGATIVE_INFINITY;
+  return top * floorRatio;
 }
 
 /**
@@ -60,9 +149,12 @@ export function applySalienceBoost(
   results: SearchResult[],
   scores: Map<string, number>,
   strength: 'on' | 'strong',
+  floorThreshold?: number,
 ): void {
   const k = strength === 'strong' ? 0.30 : 0.15;
   for (const r of results) {
+    if (!Number.isFinite(r.score)) continue;
+    if (floorThreshold !== undefined && r.score < floorThreshold) continue;
     const key = `${r.source_id ?? 'default'}::${r.slug}`;
     const score = scores.get(key);
     if (!score || score <= 0) continue;
@@ -89,12 +181,15 @@ export function applyRecencyBoost(
   decayMap: import('./recency-decay.ts').RecencyDecayMap,
   fallback: import('./recency-decay.ts').RecencyDecayConfig,
   nowMs: number = Date.now(),
+  floorThreshold?: number,
 ): void {
   const strengthMul = strength === 'strong' ? 1.5 : 1.0;
   // Sort prefixes longest-first so 'media/articles/' matches before 'media/'.
   const prefixes = Object.keys(decayMap).sort((a, b) => b.length - a.length);
 
   for (const r of results) {
+    if (!Number.isFinite(r.score)) continue;
+    if (floorThreshold !== undefined && r.score < floorThreshold) continue;
     const key = `${r.source_id ?? 'default'}::${r.slug}`;
     const d = dates.get(key);
     if (!d) continue;
@@ -131,6 +226,23 @@ export interface PostFusionOpts {
   recency: 'off' | 'on' | 'strong';
   decayMap?: import('./recency-decay.ts').RecencyDecayMap;
   fallback?: import('./recency-decay.ts').RecencyDecayConfig;
+  /**
+   * v0.35.6.0 — floor-ratio gate (opt-in, default off). When set, each
+   * metadata-axis boost stage (backlink, salience, recency) skips results
+   * whose score is below `floorRatio * topScore`. Threshold is computed
+   * ONCE at runPostFusionStages entry from the post-cosine-rescore score
+   * snapshot, then passed uniformly to all three stages — order-independent.
+   *
+   * Default undefined preserves prior behavior bit-for-bit. Sensible values
+   * for dense-embedder corpora: 0.85-0.95. See `computeFloorThreshold` for
+   * the empirical motivation and out-of-range handling.
+   *
+   * SCOPE: gates the three metadata stages only. Exact-match boost
+   * (`applyExactMatchBoost`) runs AFTER `runPostFusionStages` and is NOT
+   * gated — it's a lexical-relevance signal, different in kind from
+   * metadata boosts.
+   */
+  floorRatio?: number;
 }
 
 export async function runPostFusionStages(
@@ -140,12 +252,19 @@ export async function runPostFusionStages(
 ): Promise<void> {
   if (results.length === 0) return;
 
+  // v0.35.6.0 [floor-ratio gate]: compute threshold ONCE at entry, BEFORE any
+  // boost mutates scores. Single-baseline semantic — the same threshold gates
+  // all three downstream stages. This is intentionally different from a
+  // per-stage recompute (which would couple stage order to gating decisions);
+  // see plan `swift-sniffing-nygaard.md` D6 / codex outside-voice T2.
+  const floorThreshold = computeFloorThreshold(results, opts.floorRatio);
+
   // Backlink stage (existing behavior, preserved).
   if (opts.applyBacklinks) {
     try {
       const slugs = Array.from(new Set(results.map(r => r.slug)));
       const counts = await engine.getBacklinkCounts(slugs);
-      applyBacklinkBoost(results, counts);
+      applyBacklinkBoost(results, counts, floorThreshold);
     } catch {
       // Non-fatal; preserves the existing pre-v0.29.1 contract.
     }
@@ -162,7 +281,7 @@ export async function runPostFusionStages(
   if (opts.salience !== 'off') {
     try {
       const scores = await engine.getSalienceScores(refs);
-      applySalienceBoost(results, scores, opts.salience);
+      applySalienceBoost(results, scores, opts.salience, floorThreshold);
     } catch {
       // Non-fatal.
     }
@@ -179,6 +298,8 @@ export async function runPostFusionStages(
         opts.recency,
         opts.decayMap ?? DEFAULT_RECENCY_DECAY,
         opts.fallback ?? DEFAULT_FALLBACK,
+        Date.now(),
+        floorThreshold,
       );
     } catch {
       // Non-fatal.
@@ -213,9 +334,59 @@ export async function hybridSearch(
   query: string,
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
-  const limit = opts?.limit || 20;
+  // v0.32.3 search-lite mode: resolve the active mode + per-key overrides
+  // once at entry. Mode supplies DEFAULTS for intentWeighting, tokenBudget,
+  // expansion, and searchLimit when the caller leaves those undefined.
+  // Per-call opts and per-key config overrides still win.
+  //
+  // This MUST live in bare hybridSearch (NOT just in hybridSearchCached)
+  // because eval-replay and eval-longmemeval call bare hybridSearch — and
+  // per-mode evals would not test production search if modes lived only in
+  // the wrapper. See `[CDX-5+6]` in the plan.
+  const { loadSearchModeConfig, resolveSearchMode } = await import('./mode.ts');
+  const modeInput = await loadSearchModeConfig(engine);
+  const resolvedMode = resolveSearchMode({
+    mode: modeInput.mode,
+    overrides: modeInput.overrides,
+    perCall: {
+      intentWeighting: opts?.intentWeighting,
+      tokenBudget: opts?.tokenBudget,
+      expansion: opts?.expansion,
+      searchLimit: opts?.limit,
+      // v0.35.6.0 — floor-ratio gate thread-through. Per-call value wins
+      // over per-key config wins over mode bundle (currently undefined for
+      // all 3 bundles — pending ablation evidence).
+      floor_ratio: opts?.floorRatio,
+    },
+  });
+
+  // v0.36 (D7+D11): resolve embedding column once at entry. Single
+  // round-trip to read DB-plane config (mirrors loadSearchModeConfig).
+  // Resolver throws on unknown name with a paste-ready hint; let it
+  // propagate — a misconfig should be loud, not silently fall back.
+  // Failing cfg load (pre-config brain, mid-migration, no engine.getConfig)
+  // falls through to the file-plane sync loadConfig() — same shape, just
+  // misses DB-plane overrides.
+  const mergedCfg = await loadConfigWithEngine(engine).catch(() => null);
+  const cfgForColumn = mergedCfg ?? ((await import('../config.ts')).loadConfig()) ?? null;
+  const resolvedCol = cfgForColumn
+    ? resolveEmbeddingColumn(opts, cfgForColumn)
+    : resolveEmbeddingColumn(opts, { engine: 'pglite' });
+
+  const limit = opts?.limit || resolvedMode.searchLimit;
   const offset = opts?.offset || 0;
   const innerLimit = Math.min(limit * 2, MAX_SEARCH_LIMIT);
+
+  // v0.32.x search-lite: classify intent once up front. Drives BOTH the
+  // legacy auto-detail / salience / recency suggestions AND the new
+  // weight-adjustment path. Intent weighting is on by default and can
+  // be disabled via `opts.intentWeighting = false`. The mode bundle
+  // supplies the default when neither per-call nor per-key sets it.
+  const suggestions = classifyQuery(query);
+  const intentWeightingOn = resolvedMode.intentWeighting;
+  const intentWeights = intentWeightingOn
+    ? weightsForIntent(suggestions.intent)
+    : weightsForIntent('general');
 
   // Auto-detect detail level from query intent when caller doesn't specify
   const detail = opts?.detail ?? autoDetectDetail(query);
@@ -227,11 +398,29 @@ export async function hybridSearch(
     // per-engine searchKeyword / searchVector apply the filters at SQL level.
     language: opts?.language,
     symbolKind: opts?.symbolKind,
+    // v0.33: multi-type filter for whoknows ('person','company'). Pushes
+    // type filter to SQL level so the limit budget goes to candidate-typed
+    // pages instead of being eaten by note/transcript/article pages.
+    types: opts?.types,
     // v0.29.1: since/until take precedence over deprecated afterDate/beforeDate.
     // The engine still consumes the legacy field names; this aliasing keeps
     // PR #618 callers compiling while the new names are the public surface.
     afterDate: opts?.since ?? opts?.afterDate,
     beforeDate: opts?.until ?? opts?.beforeDate,
+    // v0.34.1 (#861, D9 — P0 leak seal): thread source-scoping through so the
+    // inner engine.searchKeyword / engine.searchVector calls apply the
+    // WHERE source_id filter at SQL level. Pre-fix, this explicit pick
+    // silently DROPPED these fields and every authenticated MCP client
+    // could see pages from foreign sources via the hybrid search hot
+    // path. New SearchOpts fields scoped to source isolation MUST be
+    // added here too; the rebuild shape is intentional (HNSW inner-CTE
+    // ordering means we can't lazy-spread the full opts).
+    sourceId: opts?.sourceId,
+    sourceIds: opts?.sourceIds,
+    // v0.36 (D11): pass the pre-validated descriptor into the engine so
+    // it never has to read config. Engines normalize string-or-descriptor
+    // via normalizeEngineColumn; the descriptor path is the strict one.
+    embeddingColumn: resolvedCol,
   };
   // Track what actually ran for the optional onMeta callback (v0.25.0).
   // Caller leaves onMeta undefined → these flags are computed but never
@@ -242,11 +431,22 @@ export async function hybridSearch(
   // A throwing user callback must never break the search hot path — onMeta
   // is a public surface (gbrain/search/hybrid) so a third-party closure bug
   // shouldn't take down query/search responses.
+  //
+  // v0.32.3 search-lite: every emitMeta call ALSO records to the in-process
+  // search_telemetry rollup. Telemetry write is sync (bumps a bucket map),
+  // flush is fire-and-forget on 60s / 100-call thresholds. The hot path
+  // never waits.
+  let lastResultsCount = 0;
   const emitMeta = (meta: HybridSearchMeta): void => {
     try {
       opts?.onMeta?.(meta);
     } catch {
       // swallow — capture telemetry is best-effort
+    }
+    try {
+      recordSearchTelemetry(engine, meta, { results_count: lastResultsCount });
+    } catch {
+      // swallow — telemetry must never break the search hot path.
     }
   };
 
@@ -254,13 +454,31 @@ export async function hybridSearch(
     console.error(`[search-debug] auto-detail=${detail} for query="${query}"`);
   }
 
-  // Run keyword search (always available, no API key needed)
-  const keywordResults = await engine.searchKeyword(query, searchOpts);
+  // Run keyword search (always available, no API key needed).
+  //
+  // v0.36 cross-modal (D9): skip keyword for 'image'-only modality. Image
+  // chunks may have OCR text in chunk_text, but a text-only keyword scan
+  // would also surface every text chunk containing the query phrase —
+  // not what an image-intent query asked for. Image vector search is the
+  // canonical channel for image-modality queries.
+  //
+  // We classify modality early (it's also computed after for the modality
+  // branch). The classification is pure regex via classifyQuery; running it
+  // here is cheap.
+  const earlyModality = (opts?.crossModal && opts.crossModal !== 'auto')
+    ? opts.crossModal
+    : (suggestions.suggestedModality ?? 'text');
+  const keywordResults: SearchResult[] =
+    earlyModality === 'image' ? [] : await engine.searchKeyword(query, searchOpts);
 
   // v0.29.1: resolve salience/recency from caller (back-compat aliases for
   // PR #618's `recencyBoost` numeric scale) or fall back to the heuristic.
   // The wrapper fires from ALL THREE return paths (codex pass-1 #2 + pass-2 #4).
-  const suggestions = classifyQuery(query);
+  //
+  // v0.32.x search-lite: when caller hasn't set recency and the intent
+  // classifier suggests one, prefer that (suggestedRecency on temporal /
+  // event intents). The legacy heuristic still wins when intent weighting
+  // is off.
   // Back-compat: recencyBoost: 1|2 → 'on'|'strong'; 0 → 'off'.
   const legacyRecency: 'off' | 'on' | 'strong' | undefined =
     opts?.recencyBoost === 2 ? 'strong' :
@@ -268,29 +486,116 @@ export async function hybridSearch(
     opts?.recencyBoost === 0 ? 'off' :
     undefined;
   const salienceMode: 'off' | 'on' | 'strong' = opts?.salience ?? suggestions.suggestedSalience;
-  const recencyMode: 'off' | 'on' | 'strong' = opts?.recency ?? legacyRecency ?? suggestions.suggestedRecency;
-  const postFusionOpts = {
+  // Intent-weighting recency suggestion is a NUDGE — it only fires when
+  // the caller left recency unspecified AND the legacy heuristic also
+  // didn't fire. The classifier's own suggestedRecency (from v0.29.1)
+  // still wins when it's set; the new intent suggestion is a fallback.
+  const intentRecency =
+    intentWeightingOn && intentWeights.suggestedRecency != null
+      ? intentWeights.suggestedRecency
+      : null;
+  const recencyMode: 'off' | 'on' | 'strong' =
+    opts?.recency
+    ?? legacyRecency
+    ?? (suggestions.suggestedRecency !== 'off'
+        ? suggestions.suggestedRecency
+        : (intentRecency ?? suggestions.suggestedRecency));
+  const postFusionOpts: PostFusionOpts = {
     applyBacklinks: true,
     salience: salienceMode,
     recency: recencyMode,
+    // v0.35.6.0 — floor-ratio gate threaded from resolved mode. Default
+    // undefined for all 3 bundles → no behavior change unless caller sets
+    // SearchOpts.floorRatio or `search.floor_ratio` config key.
+    floorRatio: resolvedMode.floor_ratio,
   };
 
   // Skip vector search entirely if the gateway has no embedding provider configured (Codex C3).
+  // v0.36 (D10): ask "is the RESOLVED column's provider reachable?" rather
+  // than "is the global default reachable?" — otherwise an unreachable
+  // global default disables vector search even when the active column's
+  // provider (Voyage, ZE) works fine.
   const { isAvailable } = await import('../ai/gateway.ts');
-  if (!isAvailable('embedding')) {
+  const providerProbe = resolvedCol.embeddingModel || undefined;
+  if (!isAvailable('embedding', providerProbe)) {
     if (keywordResults.length > 0) {
       await runPostFusionStages(engine, keywordResults, postFusionOpts);
       keywordResults.sort((a, b) => b.score - a.score);
     }
-    emitMeta({ vector_enabled: false, detail_resolved: detailResolved, expansion_applied: false });
-    return dedupResults(keywordResults).slice(offset, offset + limit);
+    const noEmbedSliced = dedupResults(keywordResults).slice(offset, offset + limit);
+    // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
+    const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
+    lastResultsCount = noEmbedBudgeted.length;
+    emitMeta({
+      vector_enabled: false,
+      detail_resolved: detailResolved,
+      expansion_applied: false,
+      intent: suggestions.intent,
+      mode: resolvedMode.resolved_mode,
+      embedding_column: resolvedCol.name,
+      ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
+        ? { token_budget: noEmbedBudgetMeta }
+        : {}),
+    });
+    return noEmbedBudgeted;
   }
+
+  // v0.36 cross-modal wave: determine the effective modality once.
+  //
+  // Precedence (D22-1 normalization): literal 'auto' is normalized to
+  // undefined so it doesn't reach the modality branch directly. Resolution:
+  //   explicit opts.crossModal ('text'|'image'|'both') wins
+  //   else suggestions.suggestedModality (regex-driven)
+  //   else (Commit 4) opt-in LLM tie-break for genuinely ambiguous queries
+  //   else 'text' (default)
+  //
+  // D9 mode-bundle override matrix: when effectiveModality === 'image',
+  // cross-modal path overrides bundle knobs (expansion=false, no keyword
+  // search). Voyage handles synonyms in-space; zerank-2 can't rerank image
+  // embeddings.
+  //
+  // Phase 3 (D8): when search.unified_multimodal is true, ALL queries
+  // route through the multimodal model + embedding_multimodal column,
+  // regardless of detected modality.
+  //
+  // Commit 4 (LLM intent escalation): when search.cross_modal.llm_intent
+  // is true AND regex returned 'text' AND isAmbiguousModalityQuery fires,
+  // await a Haiku tie-break. Fail-open to regex result on any error.
+  const explicitModality =
+    opts?.crossModal && opts.crossModal !== 'auto' ? opts.crossModal : undefined;
+  let regexModality = explicitModality ?? suggestions.suggestedModality ?? 'text';
+  // LLM tie-break fires ONLY when:
+  //   - no explicit per-call override
+  //   - regex returned 'text' (not confident image/both)
+  //   - operator opted in via search.cross_modal.llm_intent
+  //   - isAmbiguousModalityQuery says the query is genuinely ambiguous
+  if (
+    explicitModality === undefined &&
+    regexModality === 'text' &&
+    resolvedMode.cross_modal_llm_intent &&
+    isAmbiguousModalityQuery(query)
+  ) {
+    try {
+      const { classifyModalityWithLLM } = await import('./llm-intent.ts');
+      regexModality = await classifyModalityWithLLM(query, 'text');
+    } catch {
+      // Fail-open: regex result stands.
+    }
+  }
+  const effectiveModality = regexModality;
+  const unifiedRouting = resolvedMode.unified_multimodal === true;
 
   // Determine query variants (optionally with expansion)
   // expandQuery already includes the original query in its return value,
-  // so we use it directly instead of prepending query again
+  // so we use it directly instead of prepending query again.
+  // v0.32.3 search-lite: expansion fires when (a) resolved mode says yes and
+  // (b) an expandFn is wired in. The mode bundle is the default; per-call
+  // SearchOpts.expansion still wins via resolveSearchMode's chain.
+  //
+  // D9: image-modality skips expansion regardless of mode bundle.
   let queries = [query];
-  if (opts?.expansion && opts?.expandFn) {
+  const expansionAllowed = resolvedMode.expansion && effectiveModality !== 'image';
+  if (expansionAllowed && opts?.expandFn) {
     try {
       queries = await opts.expandFn(query);
       if (queries.length === 0) queries = [query];
@@ -301,17 +606,121 @@ export async function hybridSearch(
     }
   }
 
-  // Embed all query variants and run vector search
+  // Embed all query variants and run vector search.
+  //
+  // v0.36 cross-modal wave routing:
+  //   - 'text' (default): existing text-embedding path, unchanged
+  //   - 'image': embedQueryMultimodal + searchVector(embedding_image), skip keyword
+  //   - 'both': text + image vector searches in parallel; merged via weighted RRF
   let vectorLists: SearchResult[][] = [];
   let queryEmbedding: Float32Array | null = null;
-  try {
-    const embeddings = await Promise.all(queries.map(q => embed(q)));
-    queryEmbedding = embeddings[0];
-    vectorLists = await Promise.all(
-      embeddings.map(emb => engine.searchVector(emb, searchOpts)),
-    );
-  } catch {
-    // Embedding failure is non-fatal, fall back to keyword-only
+  let imageVectorList: SearchResult[] | null = null;
+  let crossModalFellOpen = false;
+
+  // Phase 3 unified routing: when on, route ALL queries through Voyage
+  // multimodal-3 + embedding_multimodal column. Bypasses the dual-column
+  // branching below — but with D8 fail-open: if the unified path returns
+  // zero rows AND the operator hasn't opted into strict unified-only mode,
+  // fall through to the dual-column text path. unified_multimodal_only
+  // disables the fallback.
+  let unifiedDone = false;
+  if (unifiedRouting) {
+    try {
+      const { isAvailable: aiIsAvailable, embedQueryMultimodal } = await import('../ai/gateway.ts');
+      if (!aiIsAvailable('embedding')) {
+        throw new Error('gateway not configured for embedding — unified multimodal would also fail');
+      }
+      const unifiedEmbedding = await embedQueryMultimodal(query);
+      const unifiedSearchOpts: SearchOpts = {
+        ...searchOpts,
+        embeddingColumn: 'embedding_multimodal',
+      };
+      const unifiedList = await engine.searchVector(unifiedEmbedding, unifiedSearchOpts);
+      // D8 fail-open: zero rows + not strict-mode → fall through to dual-column.
+      if (unifiedList.length === 0 && !resolvedMode.unified_multimodal_only) {
+        console.error(
+          `[cross-modal] unified_multimodal returned zero rows for query="${query.slice(0, 60)}". ` +
+          `Falling back to dual-column text path (partial coverage during reindex). ` +
+          `Set search.unified_multimodal_only=true to bypass this fallback when reindex completes.`,
+        );
+      } else {
+        vectorLists = [unifiedList];
+        queryEmbedding = unifiedEmbedding;
+        unifiedDone = true;
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[cross-modal] unified_multimodal embed failed; falling back to dual-column path. reason=${reason}`,
+      );
+      crossModalFellOpen = true;
+    }
+  }
+
+  if (!unifiedDone && (effectiveModality === 'image' || effectiveModality === 'both')) {
+    // Attempt image-side embedding. Fail-open: if multimodal is unconfigured
+    // OR the embed throws, log a structured warning and fall through to text.
+    try {
+      const { isAvailable: aiIsAvailable, embedQueryMultimodal } = await import('../ai/gateway.ts');
+      if (!aiIsAvailable('embedding')) {
+        throw new Error('gateway not configured for embedding — multimodal would also fail');
+      }
+      const imageEmbedding = await embedQueryMultimodal(query);
+      const imageSearchOpts: SearchOpts = {
+        ...searchOpts,
+        embeddingColumn: 'embedding_image',
+      };
+      const imageList = await engine.searchVector(imageEmbedding, imageSearchOpts);
+      for (const r of imageList) {
+        r.modality = r.modality ?? 'image';
+      }
+      imageVectorList = imageList;
+    } catch (err) {
+      // Fail-open per behavioral invariant 2.
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[cross-modal] image-side embed failed for modality=${effectiveModality}; falling back to text-only. reason=${reason}`,
+      );
+      crossModalFellOpen = true;
+    }
+  }
+
+  if (unifiedDone) {
+    // Unified routing already populated vectorLists + queryEmbedding;
+    // skip the dual-column branching.
+  } else if (effectiveModality === 'image' && imageVectorList !== null) {
+    // Image-only path: results come entirely from the image column.
+    vectorLists = [imageVectorList];
+    queryEmbedding = null; // no text embedding to cosine-re-score against
+  } else {
+    // 'text' or 'both' (or 'image' that fell open to text). Run the text
+    // path normally, with v0.36 (D10) provider-aware embed routing so a
+    // query against `embedding_voyage` actually embeds via Voyage, not
+    // the global default. Empty embeddingModel falls back to gateway
+    // default — preserves pre-v0.36 behavior for the builtin 'embedding'
+    // column.
+    try {
+      const embedOpts = resolvedCol.embeddingModel
+        ? { embeddingModel: resolvedCol.embeddingModel, dimensions: resolvedCol.dimensions }
+        : undefined;
+      const embeddings = await Promise.all(queries.map(q => embedQuery(q, embedOpts)));
+      queryEmbedding = embeddings[0];
+      const textLists = await Promise.all(
+        embeddings.map(emb => engine.searchVector(emb, searchOpts)),
+      );
+      for (const list of textLists) {
+        for (const r of list) {
+          r.modality = r.modality ?? 'text';
+        }
+      }
+      vectorLists = textLists;
+      // 'both' mode: also include the image-side list as another input to RRF.
+      if (effectiveModality === 'both' && imageVectorList !== null) {
+        vectorLists = [...vectorLists, imageVectorList];
+      }
+    } catch {
+      // Embedding failure is non-fatal, fall back to keyword-only
+    }
   }
 
   if (vectorLists.length === 0) {
@@ -323,18 +732,65 @@ export async function hybridSearch(
       await runPostFusionStages(engine, keywordResults, postFusionOpts);
       keywordResults.sort((a, b) => b.score - a.score);
     }
-    emitMeta({ vector_enabled: false, detail_resolved: detailResolved, expansion_applied: expansionApplied });
-    return dedupResults(keywordResults).slice(offset, offset + limit);
+    const kwSliced = dedupResults(keywordResults).slice(offset, offset + limit);
+    // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
+    const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
+    lastResultsCount = kwBudgeted.length;
+    emitMeta({
+      vector_enabled: false,
+      detail_resolved: detailResolved,
+      expansion_applied: expansionApplied,
+      intent: suggestions.intent,
+      mode: resolvedMode.resolved_mode,
+      embedding_column: resolvedCol.name,
+      ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
+        ? { token_budget: kwBudgetMeta }
+        : {}),
+    });
+    return kwBudgeted;
   }
 
   // Merge all result lists via RRF (includes normalization + boost)
   // Skip boost for detail=high (temporal/event queries want natural ranking)
-  const allLists = [...vectorLists, keywordResults];
-  let fused = rrfFusion(allLists, opts?.rrfK ?? RRF_K, detail !== 'high');
+  //
+  // v0.32.x search-lite: when intent weighting is on, run RRF with
+  // per-list effective k values — entity/event intents nudge keyword
+  // contributions up by lowering their k. The base rrfK still controls
+  // the overall RRF shape; intent weights tilt within that shape.
+  const baseRrfK = opts?.rrfK ?? RRF_K;
+  const keywordK = effectiveRrfK(baseRrfK, intentWeights.keywordWeight);
+  const vectorK = effectiveRrfK(baseRrfK, intentWeights.vectorWeight);
 
-  // Cosine re-scoring before dedup so semantically better chunks survive
+  // v0.36 cross-modal (D6): in 'both' mode, vectorLists carries
+  // [textList, imageList]. Apply per-modality RRF weights so the merge
+  // reflects the configured text/image balance. In 'text' and 'image'
+  // modes only one branch is present, so per-modality K reduces to
+  // the standard vectorK (no behavior change vs pre-v0.36).
+  const textRrfK = effectiveRrfK(baseRrfK, resolvedMode.cross_modal_both_text_weight);
+  const imageRrfK = effectiveRrfK(baseRrfK, resolvedMode.cross_modal_both_image_weight);
+  const isBothMode = effectiveModality === 'both' && vectorLists.length >= 2;
+
+  const allLists: Array<{ list: SearchResult[]; k: number }> = isBothMode
+    ? [
+      // Last list in vectorLists is the image branch (we appended it above).
+      // All preceding lists (1 or more text-query embeddings if expansion ran)
+      // get textRrfK. Image branch gets imageRrfK.
+      ...vectorLists.slice(0, -1).map(list => ({ list, k: textRrfK })),
+      { list: vectorLists[vectorLists.length - 1], k: imageRrfK },
+      { list: keywordResults, k: keywordK },
+    ]
+    : [
+      ...vectorLists.map(list => ({ list, k: vectorK })),
+      { list: keywordResults, k: keywordK },
+    ];
+  let fused = rrfFusionWeighted(allLists, detail !== 'high');
+
+  // Cosine re-scoring before dedup so semantically better chunks survive.
+  // v0.36 (D9): hydrate from the active embedding column so rescore happens
+  // in the same vector space the HNSW just ranked in. Pre-v0.36 this
+  // always pulled from `embedding` and silently corrupted alt-column ranks.
   if (queryEmbedding) {
-    fused = await cosineReScore(engine, fused, queryEmbedding);
+    fused = await cosineReScore(engine, fused, queryEmbedding, resolvedCol.name);
   }
 
   // v0.29.1: post-fusion stages (backlink + salience + recency) run via
@@ -343,6 +799,11 @@ export async function hybridSearch(
   // both, or neither fires depending on resolved modes.
   if (fused.length > 0) {
     await runPostFusionStages(engine, fused, postFusionOpts);
+    // v0.32.x search-lite: intent exact-match boost (entity/event intents).
+    // No-op when boost factor is 1.0 (general intent or weighting disabled).
+    if (intentWeights.exactMatchBoost !== 1.0) {
+      applyExactMatchBoost(fused, query, intentWeights);
+    }
     fused.sort((a, b) => b.score - a.score);
   }
 
@@ -405,8 +866,302 @@ export async function hybridSearch(
     return hybridSearch(engine, query, { ...opts, detail: 'high' });
   }
 
-  emitMeta({ vector_enabled: true, detail_resolved: detailResolved, expansion_applied: expansionApplied });
-  return deduped.slice(offset, offset + limit);
+  // v0.35.0.0+: cross-encoder reranker. Slots between dedup and slice so the
+  // reranker sees the full candidate pool (its own topNIn caps how many
+  // get sent upstream). Fail-open: any error returns deduped unchanged.
+  //
+  // Resolution: per-call SearchOpts.reranker overrides; otherwise pull
+  // from the resolved mode bundle (tokenmax → enabled, others → disabled).
+  // The resolved mode's fields already participate in knobsHash, so cache
+  // rows naturally segregate by reranker config.
+  const rerankerOpts = opts?.reranker ?? {
+    enabled: resolvedMode.reranker_enabled,
+    topNIn: resolvedMode.reranker_top_n_in,
+    topNOut: resolvedMode.reranker_top_n_out,
+    model: resolvedMode.reranker_model,
+    timeoutMs: resolvedMode.reranker_timeout_ms,
+  };
+  const reranked = rerankerOpts.enabled
+    ? await applyReranker(query, deduped, rerankerOpts as any)
+    : deduped;
+
+  const sliced = reranked.slice(offset, offset + limit);
+  // v0.32.3 search-lite: budget enforcement at the main return path.
+  // hybridSearchCached used to be the only place this fired; now bare
+  // hybridSearch enforces it too so eval-replay + eval-longmemeval see
+  // the same budget behavior as the production query op.
+  const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, resolvedMode.tokenBudget);
+  lastResultsCount = budgeted.length;
+  emitMeta({
+    vector_enabled: true,
+    detail_resolved: detailResolved,
+    expansion_applied: expansionApplied,
+    intent: suggestions.intent,
+    mode: resolvedMode.resolved_mode,
+    embedding_column: resolvedCol.name,
+    ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
+      ? { token_budget: budgetMeta }
+      : {}),
+  });
+  return budgeted;
+}
+
+// ----------------------------------------------------------------------
+// v0.32.x (search-lite) — cached + budgeted public wrapper
+// ----------------------------------------------------------------------
+
+/**
+ * Public wrapper around hybridSearch that adds the v0.32.x search-lite
+ * features: semantic query cache + token budget enforcement. Both are
+ * additive and backward-compatible; callers that don't opt in see the
+ * same behavior as plain hybridSearch.
+ *
+ * Pipeline:
+ *   1. Cache lookup (if enabled + we can produce a query embedding).
+ *   2. On miss: run hybridSearch normally.
+ *   3. Apply token budget (no-op when budget is undefined).
+ *   4. On miss + successful search: write back to cache (best-effort).
+ *
+ * The cache uses the same embedding the search pipeline would compute,
+ * so an extra embed() call only happens when hybridSearch would have
+ * skipped vector search entirely (no embedding provider configured). In
+ * that case the cache is also skipped — there's no embedding to key on.
+ */
+export async function hybridSearchCached(
+  engine: BrainEngine,
+  query: string,
+  opts?: HybridSearchOpts,
+): Promise<SearchResult[]> {
+  // v0.32.3 search-lite mode: resolve mode + per-key overrides once. The
+  // resolved knob set drives cache enable/threshold/TTL AND the knobs_hash
+  // that scopes the cache row so a tokenmax write can't be served to a
+  // conservative read. See [CDX-4] in the plan.
+  const { loadSearchModeConfig, resolveSearchMode, knobsHash } = await import('./mode.ts');
+  const modeInputForCache = await loadSearchModeConfig(engine);
+  const resolvedForCache = resolveSearchMode({
+    mode: modeInputForCache.mode,
+    overrides: modeInputForCache.overrides,
+    perCall: {
+      cache_enabled: opts?.useCache,
+      tokenBudget: opts?.tokenBudget,
+      expansion: opts?.expansion,
+      intentWeighting: opts?.intentWeighting,
+      searchLimit: opts?.limit,
+      // v0.35.6.0 — floor-ratio threaded through cache resolver too so
+      // knobsHash() differentiates floor-on vs floor-off cache rows.
+      // Without this, a no-floor write would be served to a floor-enabled
+      // read (ranking-correctness leak, codex T1).
+      floor_ratio: opts?.floorRatio,
+    },
+  });
+  // v0.36 (D8 / CDX-2 + codex /ship #4): resolve column for the cache
+  // decision. The query_cache.embedding column has one fixed pgvector dim
+  // sized at brain init; storing a 1024d Voyage or 2560d ZE cache
+  // embedding fails or corrupts results. Name-based check ("is it the
+  // default `embedding` column?") is insufficient — the registry
+  // explicitly allows overriding builtin `embedding` to a different
+  // provider/dim. isCacheSafe compares the resolved column's full
+  // embedding space (name + dim + model) against cfg and returns true
+  // only when ALL match. Otherwise skip.
+  const mergedCfgCached = await loadConfigWithEngine(engine).catch(() => null);
+  const cfgCached = mergedCfgCached ?? ((await import('../config.ts')).loadConfig()) ?? { engine: 'pglite' as const };
+  const resolvedColCached = resolveEmbeddingColumn(opts, cfgCached);
+  const isNonDefaultColumn = !isCacheSafe(resolvedColCached, cfgCached);
+
+  // Cache key carries the column + provider so different embedding spaces
+  // never collide on the same `(source_id, query_text)` row.
+  const cacheKnobsHash = knobsHash(resolvedForCache, {
+    embeddingColumn: resolvedColCached.name,
+    embeddingModel: resolvedColCached.embeddingModel,
+  });
+
+  // Cache decision: opts.useCache (explicit) wins over global config; global
+  // config wins over mode bundle default. Mode bundle is on for all 3 modes
+  // today; the resolver already folded everything through.
+  const cacheCfg = await loadCacheConfig(engine);
+  const cacheEnabled = resolvedForCache.cache_enabled;
+  const cache = new SemanticQueryCache(engine, {
+    ...cacheCfg,
+    enabled: cacheEnabled,
+    similarityThreshold: resolvedForCache.cache_similarity_threshold,
+    ttlSeconds: resolvedForCache.cache_ttl_seconds,
+  });
+
+  // Skip cache entirely when the request asks for two-pass walks, has
+  // a non-default embedding column (per-call or via config default —
+  // D8 closes the silent-corruption bug class), or near-symbol mode
+  // (structural state that the cache can't safely express).
+  const skipCache =
+    !cache.isEnabled() ||
+    (opts?.walkDepth ?? 0) > 0 ||
+    Boolean(opts?.nearSymbol) ||
+    isNonDefaultColumn;
+
+  let cacheStatus: 'hit' | 'miss' | 'disabled' = skipCache ? 'disabled' : 'miss';
+  let cacheSimilarity: number | undefined;
+  let cacheAge: number | undefined;
+
+  // We need a query embedding to consult the cache. We try to embed once
+  // here so the same embedding can be threaded back into the search call
+  // if it misses — but the embedding helper isn't cheap, so we only
+  // attempt it when the cache is enabled AND the gateway has an embedding
+  // provider configured.
+  let queryEmbedding: Float32Array | null = null;
+  if (!skipCache) {
+    try {
+      const { isAvailable } = await import('../ai/gateway.ts');
+      // v0.36 (D10): for the cache-lookup embedding, also use the resolved
+      // column's provider. The cache lookup is always against the default
+      // 'embedding' column (skipCache short-circuits non-default above),
+      // so this is the default embeddingModel — but threading it keeps
+      // the provider probe consistent with the bare hybridSearch path.
+      const providerProbeCached = resolvedColCached.embeddingModel || undefined;
+      if (isAvailable('embedding', providerProbeCached)) {
+        // v0.35.0.0+: query-side embedding (cache lookup path).
+        queryEmbedding = await embedQuery(query);
+      } else {
+        cacheStatus = 'disabled';
+      }
+    } catch {
+      cacheStatus = 'disabled';
+      queryEmbedding = null;
+    }
+  }
+
+  if (!skipCache && queryEmbedding && cacheStatus !== 'disabled') {
+    const hit = await cache.lookup(queryEmbedding, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash });
+    if (hit.hit && hit.results) {
+      cacheStatus = 'hit';
+      cacheSimilarity = hit.similarity;
+      cacheAge = hit.ageSeconds;
+
+      const limit = opts?.limit || 20;
+      const offset = opts?.offset || 0;
+      const sliced = hit.results.slice(offset, offset + limit);
+
+      // Budget enforcement — same pipeline tail as fresh path.
+      const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, opts?.tokenBudget);
+
+      // Emit meta describing the cache path.
+      const cachedMeta: HybridSearchMeta = {
+        vector_enabled: hit.meta?.vector_enabled ?? true,
+        detail_resolved: hit.meta?.detail_resolved ?? null,
+        expansion_applied: hit.meta?.expansion_applied ?? false,
+        intent: hit.meta?.intent,
+        cache: {
+          status: 'hit',
+          similarity: cacheSimilarity,
+          age_seconds: cacheAge,
+        },
+        ...(opts?.tokenBudget && opts.tokenBudget > 0
+          ? { token_budget: budgetMeta }
+          : {}),
+      };
+      try {
+        opts?.onMeta?.(cachedMeta);
+      } catch {
+        // swallow — telemetry is best-effort
+      }
+      return budgeted;
+    }
+  }
+
+  // Cache miss (or disabled): run the normal search. We capture meta so
+  // we can write back to the cache + emit the merged meta to the caller.
+  // The closure-write pattern trips TS's narrowing (it infers `never`), so
+  // we use a single-element box to keep the type stable.
+  const innerMetaBox: { current: HybridSearchMeta | null } = { current: null };
+  const userOnMeta = opts?.onMeta;
+  const results = await hybridSearch(engine, query, {
+    ...opts,
+    onMeta: (m) => {
+      innerMetaBox.current = m;
+      // Do NOT call userOnMeta here — we'll emit a merged meta below
+      // that also carries cache + budget info.
+    },
+  });
+  const innerMeta = innerMetaBox.current;
+
+  // Token budget pass (no-op when not set).
+  const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(results, opts?.tokenBudget);
+
+  // Compose the final meta and emit.
+  const finalMeta: HybridSearchMeta = {
+    vector_enabled: innerMeta?.vector_enabled ?? false,
+    detail_resolved: innerMeta?.detail_resolved ?? null,
+    expansion_applied: innerMeta?.expansion_applied ?? false,
+    intent: innerMeta?.intent,
+    cache: { status: cacheStatus },
+    ...(opts?.tokenBudget && opts.tokenBudget > 0
+      ? { token_budget: budgetMeta }
+      : {}),
+  };
+  try {
+    userOnMeta?.(finalMeta);
+  } catch {
+    // swallow
+  }
+
+  // Best-effort writeback (skip when search returned empty so we don't
+  // cache zero-result queries forever — they often indicate a typo).
+  if (
+    cacheStatus === 'miss' &&
+    queryEmbedding &&
+    results.length > 0 &&
+    (innerMeta?.vector_enabled ?? false)
+  ) {
+    trackCacheWrite(
+      cache
+        .store(query, queryEmbedding, results, finalMeta, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash })
+        .catch(() => { /* swallow */ }),
+    );
+  }
+
+  return budgeted;
+}
+
+/**
+ * v0.32.x search-lite — weighted RRF. Each list contributes with its own
+ * effective k value, which lets intent weighting bias keyword vs vector
+ * lists without re-weighting individual scores. Wraps rrfFusion internally
+ * by computing weighted contributions in a single pass.
+ */
+export function rrfFusionWeighted(
+  lists: Array<{ list: SearchResult[]; k: number }>,
+  applyBoost = true,
+): SearchResult[] {
+  const scores = new Map<string, { result: SearchResult; score: number }>();
+
+  for (const { list, k } of lists) {
+    for (let rank = 0; rank < list.length; rank++) {
+      const r = list[rank];
+      const key = `${r.slug}:${r.chunk_id ?? r.chunk_text.slice(0, 50)}`;
+      const existing = scores.get(key);
+      const rrfScore = 1 / (k + rank);
+
+      if (existing) {
+        existing.score += rrfScore;
+      } else {
+        scores.set(key, { result: r, score: rrfScore });
+      }
+    }
+  }
+
+  const entries = Array.from(scores.values());
+  if (entries.length === 0) return [];
+
+  const maxScore = Math.max(...entries.map(e => e.score));
+  if (maxScore > 0) {
+    for (const e of entries) {
+      e.score = e.score / maxScore;
+      const boost = applyBoost && e.result.chunk_source === 'compiled_truth' ? COMPILED_TRUTH_BOOST : 1.0;
+      e.score *= boost;
+    }
+  }
+
+  return entries
+    .sort((a, b) => b.score - a.score)
+    .map(({ result, score }) => ({ ...result, score }));
 }
 
 /**
@@ -466,6 +1221,7 @@ async function cosineReScore(
   engine: BrainEngine,
   results: SearchResult[],
   queryEmbedding: Float32Array,
+  column: string = 'embedding',
 ): Promise<SearchResult[]> {
   const chunkIds = results
     .map(r => r.chunk_id)
@@ -475,7 +1231,11 @@ async function cosineReScore(
 
   let embeddingMap: Map<number, Float32Array>;
   try {
-    embeddingMap = await engine.getEmbeddingsByChunkIds(chunkIds);
+    // v0.36 (D9): hydrate from the active column so rescore happens in
+    // the same embedding space the HNSW just ranked in. Without this,
+    // a Voyage HNSW retrieval would HNSW-rank against Voyage vectors but
+    // rescore against OpenAI vectors → NaN or wrong rankings.
+    embeddingMap = await engine.getEmbeddingsByChunkIds(chunkIds, column);
   } catch {
     // DB error is non-fatal, return results without re-scoring
     return results;

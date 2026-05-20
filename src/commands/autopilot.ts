@@ -19,11 +19,11 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, utimesSync, unlinkSync } from 'fs';
 import { join } from 'path';
-import { execSync, spawn, type ChildProcess } from 'child_process';
+import { execSync } from 'child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadPreferences } from '../core/preferences.ts';
 import { loadConfig } from '../core/config.ts';
-import { detectTini, buildSpawnInvocation } from '../core/minions/spawn-helpers.ts';
+import { ChildWorkerSupervisor } from '../core/minions/child-worker-supervisor.ts';
 
 function parseArg(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -146,55 +146,64 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   const spawnManagedWorker = useMinionsDispatch && !noWorker;
 
   let stopping = false;
-  let workerProc: ChildProcess | null = null;
-  let crashCount = 0;
-  let lastWorkerStartTime = 0;
-
-  // Stable-run reset window (matches MinionSupervisor.ts:471-476 pattern). If the
-  // worker ran > 5min before exit, treat as a fresh cycle (crashCount=1) so the
-  // RSS watchdog firing hourly does NOT trip autopilot's give-up threshold after
-  // ~5 hours of healthy uptime.
-  const STABLE_RUN_RESET_MS = 5 * 60 * 1000;
+  let childSupervisor: ChildWorkerSupervisor | null = null;
 
   if (spawnManagedWorker) {
     const cliPath = resolveGbrainCliPath();
-    // Resolve tini once at startup — not per respawn — to avoid shelling out
-    // every time the worker restarts. Reaps zombie children from shell jobs
-    // and embed batches that outlive a watchdog-killed worker.
-    const tiniPath = detectTini();
-    const startWorker = () => {
-      // Inject the RSS watchdog default (2048 MB) for the autopilot-supervised
-      // worker. Bare `gbrain jobs work` has no default; the supervisor and
-      // autopilot are the production paths that opt in.
-      const args = ['jobs', 'work', '--max-rss', '2048'];
-
-      const { cmd: spawnCmd, args: spawnArgs } = buildSpawnInvocation(tiniPath, cliPath, args);
-
-      const child = spawn(spawnCmd, spawnArgs, { stdio: 'inherit', env: process.env });
-      workerProc = child;
-      lastWorkerStartTime = Date.now();
-      console.log(`[autopilot] Minions worker spawned (pid: ${child.pid}, watchdog: 2048MB${tiniPath ? ', tini: active' : ''})`);
-
-      child.on('exit', (code) => {
-        workerProc = null;
-        if (stopping) return;
-        const runDuration = Date.now() - lastWorkerStartTime;
-        if (runDuration > STABLE_RUN_RESET_MS) {
-          // Stable run — forgive prior crash history. A watchdog-driven hourly
-          // exit (the production path post-fix) lands here every time.
-          crashCount = 1;
-        } else {
-          crashCount++;
+    // Inject the RSS watchdog default (2048 MB) for the autopilot-supervised
+    // worker. Bare `gbrain jobs work` has no default; the supervisor and
+    // autopilot are the production paths that opt in.
+    childSupervisor = new ChildWorkerSupervisor({
+      cliPath,
+      args: ['jobs', 'work', '--max-rss', '2048'],
+      // process.env clone; autopilot doesn't gate shell jobs the way the
+      // standalone supervisor does (autopilot is the operator-trust path).
+      env: { ...process.env },
+      maxCrashes: 5,
+      isStopping: () => stopping,
+      onMaxCrashesExceeded: (count, max) => {
+        console.error(`[autopilot] ${count}/${max} consecutive worker crashes, giving up.`);
+        void shutdown('max_crashes');
+      },
+      onEvent: (event) => {
+        // Route ChildWorkerSupervisor events to autopilot's stderr log.
+        // Matches the prior console output shape so operators reading
+        // existing logs see the same lines.
+        if (event.kind === 'worker_spawned') {
+          console.log(
+            `[autopilot] Minions worker spawned (pid: ${event.pid}, watchdog: 2048MB${event.tini ? ', tini: active' : ''})`,
+          );
+        } else if (event.kind === 'worker_spawn_failed') {
+          console.error(
+            `[autopilot] worker spawn failed (${event.phase}): ${event.error}${event.errnoCode ? ` (code=${event.errnoCode})` : ''}`,
+          );
+        } else if (event.kind === 'worker_exited') {
+          console.error(
+            `[autopilot] worker exited code=${event.code} signal=${event.signal} after ${event.runDurationMs}ms, crashCount=${event.crashCount}, cause=${event.likelyCause}`,
+          );
+        } else if (event.kind === 'backoff') {
+          if (event.reason === 'budget_exceeded') {
+            console.error(
+              `[autopilot] clean-restart budget exceeded; backing off ${event.ms}ms before next spawn`,
+            );
+          } else if (event.reason === 'crash') {
+            console.error(
+              `[autopilot] crash backoff ${event.ms}ms (crashCount=${event.crashCount})`,
+            );
+          }
+          // reason='clean_exit' with ms:0 is the steady-state watchdog drain;
+          // logging every iteration would be noisy. Keep silent (the
+          // worker_exited line already covers the user-visible signal).
+        } else if (event.kind === 'health_warn') {
+          console.error(
+            `[autopilot] health_warn: ${event.reason} count=${event.count} window=${event.windowMs}ms`,
+          );
         }
-        if (crashCount >= 5) {
-          console.error(`[autopilot] 5 consecutive worker crashes (run ${runDuration}ms), giving up.`);
-          process.exit(1);
-        }
-        console.error(`[autopilot] worker exited code=${code} after ${runDuration}ms, restart #${crashCount} in 10s`);
-        setTimeout(startWorker, 10_000);
-      });
-    };
-    startWorker();
+      },
+    });
+    // Fire-and-forget; runs alongside the dispatch loop. shutdown() drives
+    // the child-supervisor's isStopping accessor + drain.
+    void childSupervisor.run();
   } else if (!useMinionsDispatch) {
     const why = mode === 'off'
       ? 'minion_mode=off'
@@ -215,14 +224,11 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     if (stopping) return;
     stopping = true;
     console.log(`Autopilot stopping (${sig}).`);
-    if (workerProc) {
-      try { workerProc.kill('SIGTERM'); } catch { /* already dead */ }
-      await Promise.race([
-        new Promise<void>(r => workerProc!.once('exit', () => r())),
-        new Promise<void>(r => setTimeout(() => r(), 35_000)),
-      ]);
-      if (workerProc && !workerProc.killed) {
-        try { workerProc.kill('SIGKILL'); } catch { /* already dead */ }
+    if (childSupervisor) {
+      childSupervisor.killChild('SIGTERM');
+      await childSupervisor.awaitChildExit(35_000);
+      if (childSupervisor.childAlive) {
+        childSupervisor.killChild('SIGKILL');
       }
     }
     try { unlinkSync(lockPath); } catch { /* already gone */ }
@@ -244,6 +250,11 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   // before the queue piles up.
   const NO_WORKER_WARN_TICKS = 3;
   let noWorkerConsecutiveIdle = 0;
+  // v0.36+ T8: track time since last full cycle for the 60-min floor.
+  // Initialized to "long ago" so the first tick on a healthy brain still
+  // runs the full cycle (phase-coupling exercise) before settling into
+  // targeted-submit mode.
+  let lastFullCycleAt = 0;
 
   while (!stopping) {
     const cycleStart = Date.now();
@@ -301,35 +312,106 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     }
 
     if (useMinionsDispatch) {
-      // Submit ONE autopilot-cycle job per cycle slot. The idempotency key
-      // dedupes overrun submissions — if a cycle's job runs longer than
-      // the interval, the next submission is a no-op at the DB layer
-      // (ON CONFLICT DO NOTHING on the unique partial index).
+      // v0.36+ brain-health-100 wave (T8): targeted-submit loop.
+      //
+      // Pre-fix: every tick submitted ONE autopilot-cycle job, full phase
+      // set, regardless of brain state. On a healthy brain this was pure
+      // overhead. On a degraded brain it bundled fast wins (embed) with
+      // slow phases (synthesize) so the user waited for the slowest.
+      //
+      // New logic: compute the remediation plan (cheap; no full doctor
+      // walk), then route to the right level of intervention:
+      //   - Score >= 95 + empty plan: full cycle every 60min (phase-
+      //     coupling exercise), otherwise sleep.
+      //   - Small plan (<=3 steps, <5min): submit individual handlers.
+      //   - Large plan or low score: full autopilot-cycle (the hammer).
+      //
+      // D10 cycle-lock invariant ensures targeted-submit and
+      // autopilot-cycle can never run concurrently (both acquire
+      // gbrain-cycle), so the "60-min floor double-processes queued
+      // targeted jobs" failure mode is closed by the lock.
       try {
         const { MinionQueue } = await import('../core/minions/queue.ts');
+        const { computeRecommendations } = await import('../core/brain-score-recommendations.ts');
         const queue = new MinionQueue(engine);
         const slotMs = Math.floor(Date.now() / (baseInterval * 1000)) * baseInterval * 1000;
         const slot = new Date(slotMs).toISOString();
         const timeoutMs = Math.max(baseInterval * 2 * 1000, 300_000);
-        const job = await queue.add('autopilot-cycle',
-          { repoPath },
-          {
-            queue: 'default',
-            idempotency_key: `autopilot-cycle:${slot}`,
-            max_attempts: 2,
-            timeout_ms: timeoutMs,
-            // Submission backpressure: when the worker is dead or wedged,
-            // idempotency_key only dedupes within a slot; cross-slot pile-up
-            // is what produced the 28+ waiting-jobs production incident.
-            // maxWaiting: 1 caps at 1 active + 1 waiting; queue.add coalesces
-            // the 3rd+ submission and writes a backpressure-audit JSONL line.
-            maxWaiting: 1,
-          },
-        );
-        if (jsonMode) {
-          process.stderr.write(JSON.stringify({ event: 'dispatched', job_id: job.id, slot }) + '\n');
+
+        // Cheap path: engine.getHealth() is a single SQL count query.
+        const health = await engine.getHealth();
+        const score = health.brain_score;
+        const ctx = {
+          repoPath,
+          hasEmbeddingApiKey: !!(process.env.OPENAI_API_KEY || await engine.getConfig('openai_api_key')),
+          hasChatApiKey: !!(process.env.ANTHROPIC_API_KEY || await engine.getConfig('anthropic_api_key')),
+        };
+        const plan = computeRecommendations(health, ctx).filter((r) => r.status === 'remediable');
+        const estTotal = plan.reduce((s, r) => s + r.est_seconds, 0);
+
+        // Track time since last full cycle for the 60-min floor.
+        const FULL_CYCLE_FLOOR_MIN = 60;
+        const minutesSinceLastFull = (Date.now() - lastFullCycleAt) / 60000;
+
+        const shouldFullCycle =
+          (score >= 95 && plan.length === 0 && minutesSinceLastFull >= FULL_CYCLE_FLOOR_MIN) ||
+          plan.length > 3 ||
+          estTotal >= 300 ||
+          score < 70;
+
+        const shouldSleep = score >= 95 && plan.length === 0 && minutesSinceLastFull < FULL_CYCLE_FLOOR_MIN;
+
+        if (shouldSleep) {
+          if (jsonMode) {
+            process.stderr.write(JSON.stringify({ event: 'skip_healthy', score, plan_size: 0 }) + '\n');
+          }
+        } else if (shouldFullCycle) {
+          const job = await queue.add('autopilot-cycle',
+            { repoPath },
+            {
+              queue: 'default',
+              idempotency_key: `autopilot-cycle:${slot}`,
+              max_attempts: 2,
+              timeout_ms: timeoutMs,
+              maxWaiting: 1,
+            },
+          );
+          lastFullCycleAt = Date.now();
+          if (jsonMode) {
+            process.stderr.write(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'full', slot, score, plan_size: plan.length }) + '\n');
+          } else {
+            console.log(`[dispatch] job #${job.id} autopilot-cycle (full; score=${score})`);
+          }
         } else {
-          console.log(`[dispatch] job #${job.id} autopilot-cycle slot=${slot}`);
+          // Small targeted plan — submit individual handlers per step.
+          // D9 content-hash idempotency keys (from computeRecommendations).
+          // maxWaiting:1 per submit per codex #17 (closes the backpressure
+          // gap the prior implementation had for targeted submits).
+          for (const step of plan) {
+            try {
+              const isProtected = !!step.protected;
+              const submitOpts = {
+                queue: 'default',
+                idempotency_key: step.idempotency_key,
+                max_attempts: 2,
+                timeout_ms: timeoutMs,
+                maxWaiting: 1,
+              };
+              const job = await queue.add(
+                step.job,
+                step.params,
+                submitOpts,
+                isProtected ? { allowProtectedSubmit: true } : undefined,
+              );
+              if (jsonMode) {
+                process.stderr.write(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'targeted', step: step.id, score, plan_size: plan.length }) + '\n');
+              } else {
+                console.log(`[dispatch] job #${job.id} ${step.job} (targeted: ${step.id}; score=${score})`);
+              }
+            } catch (e) {
+              logError('dispatch.step', e);
+            }
+          }
         }
       } catch (e) { logError('dispatch', e); cycleOk = false; }
     } else {
@@ -349,7 +431,13 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
             await new Promise(r => setImmediate(r));
           },
         });
-        if (report.status === 'failed' || report.status === 'partial') {
+        // Only 'failed' (every attempted phase failed) trips the autopilot
+        // circuit breaker. 'partial' means at least one phase warned or
+        // failed while others ran — that's a soft signal, not a fatal
+        // condition. Treating 'partial' as failure here caused respawn
+        // storms under KeepAlive=true on brains where a single phase
+        // (typically `orphans`) emits a 'warn' every cycle in steady state.
+        if (report.status === 'failed') {
           cycleOk = false;
         }
         if (jsonMode) {
@@ -474,7 +562,12 @@ function writeWrapperScript(repoPath: string): string {
   const safeGbrainPath = gbrainPath.replace(/'/g, "'\\''");
   const wrapper = `#!/bin/bash
 # Auto-generated by gbrain autopilot --install
-# Sources shell profile for API keys, then runs autopilot
+# Sources shell profile for API keys, then runs autopilot.
+# zshenv is the canonical place for env vars in zsh on macOS (zshrc is for
+# interactive shells only — vars defined there don't reach this non-interactive
+# subprocess). Source it first so secrets like GBRAIN_DATABASE_URL or any
+# OPENAI/ANTHROPIC keys exported in zshenv reach autopilot.
+[ -f ~/.zshenv ] && source ~/.zshenv 2>/dev/null
 source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true
 exec '${safeGbrainPath}' autopilot --repo '${safeRepoPath}'
 `;

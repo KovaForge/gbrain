@@ -1,6 +1,6 @@
-import { execSync } from 'child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync, lstatSync } from 'fs';
-import { join, dirname } from 'path';
+import { execSync, execFileSync } from 'child_process';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
+import { basename, join, dirname, resolve } from 'path';
 import { VERSION } from '../version.ts';
 
 const GBRAIN_GITHUB_REPO = 'garrytan/gbrain';
@@ -19,27 +19,36 @@ export async function runUpgrade(args: string[]) {
 
   let upgraded = false;
   switch (method) {
-    case 'bun-link':
-      // v0.28.5: bun-link installs are source clones. Pull + bun install
-      // is the upgrade path; npm/bun's update mechanism doesn't apply.
-      console.log('Upgrading via bun-link source clone...');
-      console.log('  cd into your gbrain checkout, then run:');
-      console.log('    git pull');
-      console.log('    bun install');
-      console.log('    bun link');
-      console.log('');
-      console.log('  (auto-detect can\'t do this for you because it doesn\'t know which checkout to update.)');
-      break;
-
-    case 'bun':
-      console.log('Upgrading via bun...');
+    case 'bun-link': {
+      const linkInfo = detectBunLink();
+      if (!linkInfo) {
+        console.error('bun-link detected but could not resolve repo root.');
+        break;
+      }
+      console.log(`Upgrading bun-link source clone at ${linkInfo.repoRoot}...`);
       try {
-        execSync('bun update gbrain', { stdio: 'inherit', timeout: 120_000 });
+        execFileSync('git', ['-C', linkInfo.repoRoot, 'pull', '--ff-only'], { stdio: 'inherit', timeout: 120_000 });
+        execFileSync('bun', ['install'], { cwd: linkInfo.repoRoot, stdio: 'inherit', timeout: 120_000 });
         upgraded = true;
       } catch {
-        console.error('Upgrade failed. Try running manually: bun update gbrain');
+        console.error('Auto-upgrade failed. Try manually:');
+        console.error(`  cd ${linkInfo.repoRoot} && git pull && bun install`);
       }
       break;
+    }
+
+    case 'bun': {
+      console.log('Upgrading via bun...');
+      const bunGlobalRoot = resolveBunGlobalRoot();
+      try {
+        execFileSync('bun', ['update', 'gbrain'], { cwd: bunGlobalRoot, stdio: 'inherit', timeout: 120_000 });
+        upgraded = true;
+      } catch {
+        console.error('Upgrade failed. Try running manually:');
+        console.error(`  cd ${bunGlobalRoot} && bun update gbrain`);
+      }
+      break;
+    }
 
     case 'binary':
       console.log('Binary self-update not yet implemented.');
@@ -99,6 +108,46 @@ export async function runUpgrade(args: string[]) {
     } catch {
       // features scan is best-effort
     }
+  }
+}
+
+export function resolveBunGlobalRoot(): string {
+  const bunInstall = process.env.BUN_INSTALL;
+  if (bunInstall) {
+    return join(bunInstall, 'install', 'global');
+  }
+
+  const defaultRoot = join(process.env.HOME || '', '.bun', 'install', 'global');
+  if (isBunGlobalRoot(defaultRoot)) {
+    return defaultRoot;
+  }
+
+  const installRoot = findBunInstallRootFromArgv();
+  return installRoot ?? defaultRoot;
+}
+
+function isBunGlobalRoot(dir: string): boolean {
+  return existsSync(join(dir, 'package.json')) && existsSync(join(dir, 'node_modules'));
+}
+
+function findBunInstallRootFromArgv(): string | null {
+  try {
+    const argv1 = process.argv[1];
+    if (!argv1) return null;
+
+    let dir = dirname(realpathSync(argv1));
+    for (let i = 0; i < 10; i++) {
+      if (basename(dir) === 'gbrain' && basename(dirname(dir)) === 'node_modules') {
+        const root = dirname(dirname(dir));
+        if (isBunGlobalRoot(root)) return root;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -192,6 +241,16 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
     console.log('Idempotent — safe to re-run any time.');
     return;
   }
+
+  // v0.35.8.0: lay down ~/.gbrain/.gitignore retroactively. Existing users
+  // never re-run `gbrain init`, so init-only coverage misses them entirely
+  // (codex F-CDX-8). Idempotent + non-clobbering — safe to run every upgrade.
+  try {
+    const { ensureGitignore } = await import('../core/config.ts');
+    ensureGitignore();
+  } catch {
+    // Best-effort hygiene; never block upgrade.
+  }
   // Cosmetic: print feature pitches for migrations newer than the prior binary.
   try {
     const statePath = join(process.env.HOME || '', '.gbrain', 'upgrade-state.json');
@@ -250,6 +309,71 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
         await engine.connect(toCfgSchema(cfgSchema));
         await engine.initSchema();
         console.log('  Schema up to date.');
+
+        // v0.32.3 search-lite mode banner. One-shot: fires at most once per
+        // install (state persisted via `search.mode_upgrade_notice_shown`).
+        // Reframes from "behavior is regressing" to "named modes available"
+        // per [CDX-1+2+3]: the production query op still defaults expand=true
+        // and limit=20 — Garry's behavior is NOT regressing.
+        try {
+          const shown = await engine.getConfig('search.mode_upgrade_notice_shown');
+          const existingMode = await engine.getConfig('search.mode');
+          if (shown !== 'true' && !existingMode) {
+            console.log('');
+            console.log('═══════════════════════════════════════════════════════════════');
+            console.log('[gbrain] v0.32.3 added named search modes (conservative/balanced/tokenmax).');
+            console.log('[gbrain] Your current behavior is unchanged — the `query` op still defaults');
+            console.log('[gbrain] expand=true and limit=20, same as v0.31.x.');
+            console.log('═══════════════════════════════════════════════════════════════');
+            console.log('');
+            console.log('[AGENT] Relay this matrix to your operator and ask which mode they want.');
+            console.log('[AGENT] Recommended default: tokenmax (preserves current retrieval shape).');
+            console.log('[AGENT] Run `gbrain config set search.mode <mode>` after they decide.');
+            console.log('');
+            console.log('Per-query cost @ 10K queries/mo (typical single-user volume):');
+            console.log('');
+            console.log('                  Haiku 4.5    Sonnet 4.6   Opus 4.7');
+            console.log('                  ($1/M)       ($3/M)       ($5/M)');
+            console.log('  conservative    $40/mo       $120/mo      $200/mo');
+            console.log('  balanced        $100/mo      $300/mo      $500/mo');
+            console.log('  tokenmax        $200/mo      $600/mo      $1,000/mo');
+            console.log('');
+            console.log('  (scales linearly — multiply by 10 for 100K/mo)');
+            console.log('  25x corner-to-corner spread. Natural diagonal pairings span ~4x.');
+            console.log('');
+            console.log('To pick:');
+            console.log('  gbrain search modes              # see what is running');
+            console.log('  gbrain config set search.mode <conservative|balanced|tokenmax>');
+            console.log('  gbrain search tune               # data-driven recommendations');
+            console.log('');
+            console.log('tokenmax bumps limit to 50 (current default is 20). To preserve');
+            console.log('your EXACT current shape:');
+            console.log('  gbrain config set search.mode tokenmax');
+            console.log('  gbrain config set search.searchLimit 20');
+            console.log('');
+            await engine.setConfig('search.mode_upgrade_notice_shown', 'true');
+          }
+        } catch {
+          // Banner is cosmetic; never block the upgrade.
+        }
+
+        // v0.32.7 CJK wave: chunker-version bump → re-embed sweep.
+        // Idempotent — `runReindex` short-circuits when no pages are pending.
+        try {
+          const { runPostUpgradeReembedPrompt } = await import('../core/post-upgrade-reembed.ts');
+          const { getEmbeddingModel } = await import('../core/ai/gateway.ts');
+          let modelString = 'openai:text-embedding-3-large';
+          try { modelString = getEmbeddingModel(); } catch { /* gateway not configured — keep default */ }
+          const promptResult = await runPostUpgradeReembedPrompt(engine, modelString);
+          if (promptResult.proceeded) {
+            const { runReindex } = await import('./reindex.ts');
+            await runReindex(engine, ['--markdown']);
+          }
+        } catch (re) {
+          const msg = re instanceof Error ? re.message : String(re);
+          console.warn(`\nChunker-bump reindex skipped: ${msg}`);
+          console.warn('Run `gbrain reindex --markdown` manually when ready.');
+        }
       } finally {
         try { await engine.disconnect(); } catch { /* best-effort */ }
       }
@@ -271,6 +395,80 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
     printAdvisoryIfRecommended({ version: VERSION, context: 'upgrade' });
   } catch {
     // Best-effort cosmetic surface; never block post-upgrade.
+  }
+
+  // v0.36 DX: skillpack reference sweep. After an upgrade, the gbrain bundle
+  // may have shipped changes to scaffolded skills the host already has on
+  // disk. Run `reference --all` automatically and print a one-line-per-skill
+  // summary so the agent + operator see what drifted without manually
+  // running the sweep. Skipped silently when:
+  //   - GBRAIN_SKIP_REFERENCE_SWEEP=1 in env
+  //   - no target workspace can be auto-detected (gbrain installed but
+  //     never scaffolded anywhere)
+  //   - the detected workspace IS the gbrain repo (dev-mode, would just
+  //     compare gbrain against itself)
+  //   - every scaffolded skill is identical (nothing to say)
+  await postUpgradeReferenceSweep();
+}
+
+/**
+ * Run `reference --all` against the auto-detected host workspace and print
+ * a one-line-per-skill summary of any drift. Best-effort; failures are
+ * swallowed so a broken sweep never blocks post-upgrade.
+ *
+ * Exported (with optional `opts` test seam) for unit testing the gate
+ * logic + output shape. Production callers pass no args — both paths are
+ * auto-detected.
+ */
+export async function postUpgradeReferenceSweep(
+  opts: { gbrainRoot?: string; targetWorkspace?: string } = {},
+): Promise<void> {
+  if (process.env.GBRAIN_SKIP_REFERENCE_SWEEP) return;
+  try {
+    const { autoDetectSkillsDirReadOnly } = await import('../core/repo-root.ts');
+    const { findGbrainRoot } = await import('../core/skillpack/bundle.ts');
+    const { runReferenceAll } = await import('../core/skillpack/reference.ts');
+    const path = await import('path');
+
+    // Allow tests to inject; default to auto-detection.
+    let targetWorkspace = opts.targetWorkspace;
+    if (!targetWorkspace) {
+      const detected = autoDetectSkillsDirReadOnly();
+      if (!detected.dir) return;
+      targetWorkspace = path.resolve(detected.dir, '..');
+    }
+
+    const gbrainRoot = opts.gbrainRoot ?? findGbrainRoot();
+    if (!gbrainRoot) return;
+
+    // Dev-mode guard: the detected workspace IS the gbrain repo. Sweeping
+    // gbrain against itself is always identical — print nothing.
+    if (path.resolve(targetWorkspace) === path.resolve(gbrainRoot)) return;
+
+    const result = runReferenceAll({ gbrainRoot, targetWorkspace });
+    // Print only skills that (a) the host has actually scaffolded, AND
+    // (b) have at least one differs or missing entry. Pure-`missing`
+    // skills the host never scaffolded are noise; skip them.
+    const drifted = result.skills.filter(
+      s =>
+        s.summary.identical + s.summary.differs > 0 &&
+        (s.summary.differs > 0 || s.summary.missing > 0),
+    );
+    if (drifted.length === 0) return;
+
+    console.log('');
+    console.log('Skillpack reference sweep (post-upgrade):');
+    for (const s of drifted) {
+      console.log(
+        `  ${s.slug.padEnd(40)} differs:${s.summary.differs} missing:${s.summary.missing}`,
+      );
+    }
+    console.log('');
+    console.log(
+      'Run `gbrain skillpack reference <slug>` to inspect per-skill diffs.\nSee `skills/_AGENT_README.md` for what your agent should do on update.\nSkip this sweep: `GBRAIN_SKIP_REFERENCE_SWEEP=1`.',
+    );
+  } catch {
+    // Best-effort. Never block post-upgrade.
   }
 }
 
@@ -298,7 +496,7 @@ export function detectInstallMethod(): 'bun' | 'bun-link' | 'binary' | 'clawhub'
   // resolves into a directory we can walk up from to find a .git/config
   // pointing at our repo.
   const bunLinkResult = detectBunLink();
-  if (bunLinkResult === 'bun-link') return 'bun-link';
+  if (bunLinkResult) return 'bun-link';
 
   // Check if running from node_modules (bun/npm install). Could be canonical
   // (we publish under garrytan/gbrain) OR the squatter (npm `gbrain@1.3.x`).
@@ -328,51 +526,39 @@ export function detectInstallMethod(): 'bun' | 'bun-link' | 'binary' | 'clawhub'
 }
 
 /**
- * v0.28.5 cluster D, signal 1 — bun-link detection (closes #656).
+ * Detect bun-link source-clone installs (closes #656, fixes #368).
  *
- * argv[1] is what `bun /path/to/cli.ts` was invoked with. When `bun link`
- * is in play, that path is typically a symlink (~/.bun/bin/gbrain) to
- * either the source repo's compiled binary or src/cli.ts directly.
- * Walk up from the realpath looking for a `.git/config` whose remote
- * url contains `garrytan/gbrain` (case-insensitive substring).
+ * Walk up from argv[1] looking for a `.git/config` whose remote url
+ * contains `garrytan/gbrain` (case-insensitive substring).
  *
- * Returns 'bun-link' when we're confident; null otherwise (caller falls
- * through to the existing detection chain). Best-effort: forks, tarball
- * installs, detached source trees, and `.git`-less installs all fall
- * through, which is acceptable per codex's plan-review feedback.
+ * v0.28.5 gated on lstatSync(argv1).isSymbolicLink(), but bun resolves
+ * the entire symlink chain before setting process.argv[1], so the check
+ * always returned false and short-circuited detection. Now we skip the
+ * symlink check and use argv[1] directly — it is already the real path
+ * inside the checkout, which is exactly what the git-config walk needs.
+ *
+ * Returns { repoRoot } when confident; null otherwise (caller falls
+ * through to the existing detection chain).
  */
-function detectBunLink(): 'bun-link' | null {
+function detectBunLink(): { repoRoot: string } | null {
   try {
     const argv1 = process.argv[1];
     if (!argv1) return null;
 
-    // Symlink check first: `bun link` always creates one.
-    let isSymlink = false;
-    try {
-      isSymlink = lstatSync(argv1).isSymbolicLink();
-    } catch {
-      return null;
-    }
-    if (!isSymlink) return null;
-
-    const resolved = realpathSync(argv1);
-    let dir = dirname(resolved);
-    // Walk up at most 6 levels looking for .git/config.
+    let dir = dirname(resolve(argv1));
     for (let i = 0; i < 6; i++) {
       const gitConfigPath = join(dir, '.git', 'config');
       if (existsSync(gitConfigPath)) {
         try {
           const cfg = readFileSync(gitConfigPath, 'utf-8');
-          // Loose substring match: covers https://, git@, ssh://, fork URLs
-          // that mention upstream in [remote "upstream"], and case variants.
           if (cfg.toLowerCase().includes(GBRAIN_GITHUB_REPO.toLowerCase())) {
-            return 'bun-link';
+            return { repoRoot: dir };
           }
         } catch { /* unreadable config — not our case */ }
-        return null; // found .git/config but no match → not our repo
+        return null;
       }
       const parent = dirname(dir);
-      if (parent === dir) break; // reached filesystem root
+      if (parent === dir) break;
       dir = parent;
     }
     return null;

@@ -27,11 +27,14 @@ import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST } from '../core/scope.ts';
-import { summarizeMcpParams } from '../mcp/dispatch.ts';
+import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
+import { paramDefToSchema } from '../mcp/tool-defs.ts';
+import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildError, serializeError } from '../core/errors.ts';
 import { VERSION } from '../version.ts';
 import * as db from '../core/db.ts';
+import { sqlQueryForEngine, executeRawJsonb } from '../core/sql-query.ts';
 
 /**
  * /health endpoint timeout. 3s rather than 5s: Fly.io's default
@@ -40,6 +43,44 @@ import * as db from '../core/db.ts';
  * 3s leaves 2s of headroom for TCP, response framing, and clock skew.
  */
 export const HEALTH_TIMEOUT_MS = 3000;
+
+/**
+ * v0.36.1.x #1024: bootstrap token resolution.
+ *
+ * Pure helper (no side effects, no process.exit) so the rule is unit-testable.
+ * Two outcomes:
+ *   - `ok`: caller proceeds with `{token, fromEnv}`. When the env value is
+ *     undefined, a fresh 32-byte hex token is generated.
+ *   - `error`: caller refuses to start. We require 32+ chars matching
+ *     `[A-Za-z0-9_-]+` for env-supplied tokens — fail-closed beats silently
+ *     accepting a weak admin secret.
+ *
+ * `randomBytesHex` is parameterized so tests can inject a deterministic
+ * fallback without monkey-patching `crypto.randomBytes`.
+ */
+export type BootstrapTokenResolution =
+  | { kind: 'ok'; token: string; fromEnv: boolean }
+  | { kind: 'error'; message: string };
+
+export function resolveBootstrapToken(
+  envValue: string | undefined,
+  randomBytesHex: () => string = () => randomBytes(32).toString('hex'),
+): BootstrapTokenResolution {
+  if (envValue === undefined) {
+    return { kind: 'ok', token: randomBytesHex(), fromEnv: false };
+  }
+  const trimmed = envValue.trim();
+  if (!/^[A-Za-z0-9_-]{32,}$/.test(trimmed)) {
+    return {
+      kind: 'error',
+      message:
+        'GBRAIN_ADMIN_BOOTSTRAP_TOKEN must be at least 32 chars and match [A-Za-z0-9_-]+.\n' +
+        '  Refusing to start with a weak admin bootstrap token. Generate one with:\n' +
+        '    head -c 32 /dev/urandom | base64 | tr -d "+/=" | head -c 48',
+    };
+  }
+  return { kind: 'ok', token: trimmed, fromEnv: true };
+}
 
 export type ProbeHealthResult =
   | { ok: true; status: 200; body: { status: 'ok'; version: string; engine: string; [k: string]: unknown } }
@@ -160,10 +201,40 @@ interface ServeHttpOptions {
    * at startup so the privacy posture change is visible.
    */
   logFullParams?: boolean;
+  /**
+   * Network interface(s) to bind. Defaults to `127.0.0.1` (loopback only) in
+   * v0.34.1+ — gbrain's primary use case is a personal-knowledge brain on a
+   * laptop, and the pre-v0.34 default of `0.0.0.0` made it one accidental
+   * `--http` invocation away from publishing the brain to a LAN.
+   *
+   * Server operators who DO want to accept remote connections pass
+   * `--bind 0.0.0.0` (or a specific interface IP). When `--public-url` is
+   * set but `--bind` is unset, a stderr WARN fires at startup recommending
+   * the explicit flag — defaulting to loopback while declaring a public URL
+   * is almost always a misconfiguration.
+   */
+  bind?: string;
+  /**
+   * v0.36.x #1024: suppress the printed admin bootstrap token line on
+   * startup. Combined with `GBRAIN_ADMIN_BOOTSTRAP_TOKEN`, lets long-lived
+   * production deployments avoid leaking the token into log aggregators on
+   * every supervisor-managed restart. When the env var is NOT set, this
+   * flag still suppresses the print — operators take responsibility for
+   * tracking the regenerated value through other means.
+   */
+  suppressBootstrapToken?: boolean;
 }
 
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, publicUrl, logFullParams } = options;
+  // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
+  // gbrain's primary use case is a personal-knowledge brain on a laptop;
+  // the pre-v0.34 default exposed brains on every interface. Server
+  // operators who need remote access pass `--bind 0.0.0.0` (or a specific
+  // interface). Declaring `--public-url` without `--bind` is almost always
+  // a misconfiguration; we WARN to stderr at startup in that case rather
+  // than silently binding loopback only.
+  const bind = options.bind ?? '127.0.0.1';
   const config = loadConfig() || { engine: 'pglite' as const };
 
   if (logFullParams) {
@@ -172,8 +243,18 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     );
   }
 
-  // Get raw SQL connection for OAuth provider
-  const sql = db.getConnection() as SqlQuery;
+  if (publicUrl && options.bind === undefined) {
+    console.error(
+      '[serve-http] WARNING: --public-url is set but --bind is not. Default bind changed to 127.0.0.1 in v0.34.1; remote clients reaching the public URL will be refused. Pass --bind 0.0.0.0 to accept all interfaces.',
+    );
+  }
+
+  // Engine-aware SQL adapter. Routes through engine.executeRaw on both
+  // Postgres and PGLite — the OAuth/admin/auth surface no longer requires
+  // a postgres.js singleton, so `gbrain serve --http` works against PGLite
+  // brains too. The narrow SqlQuery contract is scalar-binds-only; JSONB
+  // writes use executeRawJsonb (see mcp_request_log INSERT sites below).
+  const sql = sqlQueryForEngine(engine);
 
   // Initialize OAuth provider. F12 cleanup: DCR-disable now flips a
   // constructor option instead of monkey-patching `_clientsStore` after
@@ -193,9 +274,23 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     console.error('Token sweep failed (non-blocking):', e instanceof Error ? e.message : e);
   }
 
-  // Generate bootstrap token for admin dashboard
-  const bootstrapToken = randomBytes(32).toString('hex');
+  // v0.36.x #1024: bootstrap token sourcing.
+  //
+  // Default: regenerate per process start, print to stderr so the operator
+  // can paste into /admin login. Stable across restarts only when env var
+  // is set. The env override must be a strong secret — `[A-Za-z0-9_-]{32+}`
+  // — otherwise refuse to start. Logging the bootstrap-token value every
+  // restart is the original gripe; with `GBRAIN_ADMIN_BOOTSTRAP_TOKEN` set
+  // and `--suppress-bootstrap-token`, no value reaches the log.
+  const resolved = resolveBootstrapToken(process.env.GBRAIN_ADMIN_BOOTSTRAP_TOKEN);
+  if (resolved.kind === 'error') {
+    console.error(resolved.message);
+    process.exit(1);
+  }
+  let bootstrapToken: string = resolved.token;
+  let bootstrapFromEnv: boolean = resolved.fromEnv;
   const bootstrapHash = createHash('sha256').update(bootstrapToken).digest('hex');
+  const suppressBootstrapPrint = options.suppressBootstrapToken === true;
   const adminSessions = new Map<string, number>(); // sessionId → expiresAt
 
   // SSE clients for live activity feed
@@ -586,6 +681,150 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.status(result.status).json(result.body);
   });
 
+  // v0.36.1.0 (T15 / E6 / D23) — Calibration tab data endpoints.
+  // Server-rendered SVG charts; admin SPA renders via TrustedSVG wrapper.
+  // v0.36.1.0 (TD3) — pattern drill-down. Returns the source takes that
+  // produced the pattern statement at index `id` of the active profile.
+  // v0.36.1.0 ship state: returns the top N takes in the holder's overall
+  // takes table, sorted by weight desc. v0.37+ will store per-pattern
+  // source_take_ids on calibration_profiles_patterns so the drill-down
+  // shows the EXACT takes that drove the pattern.
+  app.get('/admin/api/calibration/pattern/:id', requireAdmin, async (req: Request, res: Response) => {
+    try {
+      const { getLatestProfile } = await import('./calibration.ts');
+      const holder = (req.query.holder as string) || 'garry';
+      const profile = await getLatestProfile(engine, { holder });
+      if (!profile) {
+        res.status(404).json({ error: 'no_profile' });
+        return;
+      }
+      const rawId = req.params.id;
+      const idStr = Array.isArray(rawId) ? rawId[0] : rawId;
+      const idx = Number.parseInt(idStr ?? '', 10) - 1;
+      if (!Number.isFinite(idx) || idx < 0 || idx >= profile.pattern_statements.length) {
+        res.status(400).json({ error: 'invalid_pattern_index', max: profile.pattern_statements.length });
+        return;
+      }
+      const statement = profile.pattern_statements[idx];
+      // v0.36.1.0 ship state: surface the top resolved takes for the
+      // holder as drill-down evidence. Per-pattern provenance is v0.37.
+      const takes = await engine.executeRaw<{
+        id: number;
+        page_slug: string;
+        row_num: number;
+        claim: string;
+        weight: number;
+        resolved_quality: string | null;
+        since_date: string | null;
+      }>(
+        `SELECT id, page_slug, row_num, claim, weight, resolved_quality, since_date
+           FROM takes
+           WHERE holder = $1 AND active = true AND resolved_at IS NOT NULL
+           ORDER BY weight DESC, since_date DESC
+           LIMIT 25`,
+        [holder],
+      );
+      res.json({
+        pattern_statement: statement,
+        pattern_index: idx + 1,
+        holder,
+        provenance_note: 'v0.36.1.0 ship state shows top-25 resolved takes for this holder; per-pattern source_take_ids land in v0.37.',
+        takes,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'unknown' });
+    }
+  });
+
+  app.get('/admin/api/calibration/profile', requireAdmin, async (req: Request, res: Response) => {
+    try {
+      const { getLatestProfile } = await import('./calibration.ts');
+      const holder = (req.query.holder as string) || 'garry';
+      const profile = await getLatestProfile(engine, { holder });
+      res.json(profile);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'unknown' });
+    }
+  });
+
+  app.get('/admin/api/calibration/charts/:type', requireAdmin, async (req: Request, res: Response) => {
+    try {
+      const { getLatestProfile } = await import('./calibration.ts');
+      const {
+        renderBrierTrend,
+        renderDomainBars,
+        renderAbandonedThreadsCard,
+        renderPatternStatementsCard,
+      } = await import('../core/calibration/svg-renderer.ts');
+      const holder = (req.query.holder as string) || 'garry';
+      const type = req.params.type;
+      const profile = await getLatestProfile(engine, { holder });
+
+      res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+      res.setHeader('Cache-Control', 'private, max-age=60');
+
+      if (type === 'brier-trend') {
+        // v0.36.1.0 ship state: 1-point series from the active profile. A
+        // proper 90-day time series will read from calibration_profiles
+        // generated_at history in v0.37 once we have multiple snapshots.
+        const series = profile?.brier !== null && profile?.brier !== undefined
+          ? [{ date: profile.generated_at.slice(0, 10), brier: profile.brier }]
+          : [];
+        return res.send(renderBrierTrend({ series }));
+      }
+      if (type === 'domain-bars') {
+        // v0.36.1.0 ship state: domain_scorecards JSONB is a placeholder
+        // (per-domain rendering comes when batchGetTakesScorecards lands in
+        // a follow-up). Render empty for now.
+        return res.send(renderDomainBars({ bars: [] }));
+      }
+      if (type === 'pattern-statements') {
+        return res.send(
+          renderPatternStatementsCard(
+            (profile?.pattern_statements ?? []).map((text: string) => ({ text })),
+          ),
+        );
+      }
+      if (type === 'abandoned-threads') {
+        // v0.36.1.0 ship state: pull abandoned threads inline via a small
+        // SQL query (the doctor check counts them; this surfaces details).
+        const rows = await engine.executeRaw<{
+          id: number;
+          page_slug: string;
+          claim: string;
+          weight: number;
+          since_date: string;
+        }>(
+          `SELECT id, page_slug, claim, weight, since_date
+             FROM takes
+             WHERE active = true AND resolved_at IS NULL AND superseded_by IS NULL
+               AND weight >= 0.7
+               AND since_date::date < (now() - INTERVAL '12 months')
+             ORDER BY since_date ASC
+             LIMIT 5`,
+        );
+        const now = new Date();
+        const threads = rows.map(r => {
+          const since = new Date((r.since_date.length === 7 ? r.since_date + '-15' : r.since_date));
+          const monthsSilent = Math.max(0, Math.floor((now.getTime() - since.getTime()) / (1000 * 60 * 60 * 24 * 30)));
+          return {
+            takeId: r.id,
+            pageSlug: r.page_slug,
+            claim: r.claim,
+            monthsSilent,
+            conviction: r.weight,
+          };
+        });
+        return res.send(renderAbandonedThreadsCard(threads));
+      }
+      res.status(400).json({ error: 'unknown_chart_type', supported: ['brier-trend', 'domain-bars', 'pattern-statements', 'abandoned-threads'] });
+      return;
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'unknown' });
+      return;
+    }
+  });
+
   app.get('/admin/api/requests', requireAdmin, async (req: Request, res: Response) => {
     try {
       const page = parseInt(req.query.page as string) || 1;
@@ -595,27 +834,44 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const operation = req.query.operation as string;
       const status = req.query.status as string;
 
-      // Dynamic filtering via postgres.js tagged-template fragments.
-      // Each filter expands to either `AND col = $N` (parameterized) or
-      // an empty fragment. `WHERE 1=1` lets us always have a WHERE clause
-      // and unconditionally append AND-prefixed fragments — no string
-      // interpolation, no manual escaping, no sql.unsafe.
-      const agentFilter = agent && agent !== 'all' ? sql`AND token_name = ${agent}` : sql``;
-      const opFilter = operation && operation !== 'all' ? sql`AND operation = ${operation}` : sql``;
-      const statusFilter = status && status !== 'all' ? sql`AND status = ${status}` : sql``;
+      // Dynamic filtering: SqlQuery is deliberately scalar-only and does not
+      // support fragment composition (the prior `sql\`AND ... = ${v}\`` shape).
+      // Build the WHERE clause with positional placeholders + a params array.
+      // `WHERE 1=1` lets us always have a WHERE clause and conditionally
+      // append `AND col = $N` fragments — still parameterized, still escaped
+      // by the driver, no sql.unsafe.
+      const filters: string[] = [];
+      const params: (string | number)[] = [];
+      if (agent && agent !== 'all') {
+        filters.push(`AND token_name = $${params.length + 1}`);
+        params.push(agent);
+      }
+      if (operation && operation !== 'all') {
+        filters.push(`AND operation = $${params.length + 1}`);
+        params.push(operation);
+      }
+      if (status && status !== 'all') {
+        filters.push(`AND status = $${params.length + 1}`);
+        params.push(status);
+      }
+      const filterSql = filters.join(' ');
+      const limitParam = `$${params.length + 1}`;
+      const offsetParam = `$${params.length + 2}`;
 
-      const rows = await sql`
-        SELECT id, token_name, COALESCE(agent_name, token_name) as agent_name,
-               operation, latency_ms, status, params, error_message, created_at
-        FROM mcp_request_log
-        WHERE 1=1 ${agentFilter} ${opFilter} ${statusFilter}
-        ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}
-      `;
-      const [countResult] = await sql`
-        SELECT count(*)::int as total FROM mcp_request_log
-        WHERE 1=1 ${agentFilter} ${opFilter} ${statusFilter}
-      `;
-      res.json({ rows, total: (countResult as any).total, page, pages: Math.ceil((countResult as any).total / limit) });
+      const rows = await engine.executeRaw(
+        `SELECT id, token_name, COALESCE(agent_name, token_name) as agent_name,
+                operation, latency_ms, status, params, error_message, created_at
+         FROM mcp_request_log
+         WHERE 1=1 ${filterSql}
+         ORDER BY created_at DESC LIMIT ${limitParam} OFFSET ${offsetParam}`,
+        [...params, limit, offset],
+      );
+      const [countResult] = await engine.executeRaw<{ total: number }>(
+        `SELECT count(*)::int as total FROM mcp_request_log
+         WHERE 1=1 ${filterSql}`,
+        params,
+      );
+      res.json({ rows, total: countResult.total, page, pages: Math.ceil(countResult.total / limit) });
     } catch {
       res.status(503).json({ error: 'service_unavailable' });
     }
@@ -664,11 +920,22 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Register client from admin dashboard
   app.post('/admin/api/register-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
     try {
-      const { name, scopes, tokenTtl } = req.body;
+      const { name, scopes, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      const grants = Array.isArray(grantTypes) && grantTypes.length > 0 ? grantTypes : ['client_credentials'];
+      const uris = Array.isArray(redirectUris) ? redirectUris : [];
       const result = await oauthProvider.registerClientManual(
-        name, ['client_credentials'], scopes || 'read', [],
+        name, grants, scopes || 'read', uris,
       );
+      // Public client (PKCE-only, no secret): NULL out client_secret_hash and
+      // set auth method so the SDK's clientAuth middleware skips the hash-vs-
+      // plaintext comparison that would otherwise reject the request. This is
+      // the supported pattern for browser-based OAuth (e.g. claude.ai's
+      // Custom Connector flow, which uses authorization_code + PKCE).
+      if (tokenEndpointAuthMethod === 'none') {
+        await sql`UPDATE oauth_clients SET client_secret_hash = NULL, token_endpoint_auth_method = 'none' WHERE client_id = ${result.clientId}`;
+        delete (result as any).clientSecret;
+      }
       // Set per-client TTL if specified
       if (tokenTtl && Number(tokenTtl) > 0) {
         await sql`UPDATE oauth_clients SET token_ttl = ${Number(tokenTtl)} WHERE client_id = ${result.clientId}`;
@@ -721,21 +988,63 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   });
 
   // ---------------------------------------------------------------------------
-  // Admin SPA static files
+  // Admin SPA static files (v0.36.x #1090)
   // ---------------------------------------------------------------------------
-  // Serve from admin/dist if it exists (development), otherwise embedded assets
+  // Two-tier resolution:
+  //   1. Dev path — admin/dist next to cwd. Vite rebuilds land here first,
+  //      so devs hacking on the SPA see changes without re-running
+  //      build-admin-embedded.
+  //   2. Binary path — `src/admin-embedded.ts` exports `ADMIN_ASSETS`, a
+  //      manifest of request-path → resolved-path keyed by every file in
+  //      admin/dist at generation time. Bun's `with { type: 'file' }` ESM
+  //      imports resolve correctly inside the compiled binary, so a
+  //      globally-installed `gbrain serve --http` actually serves /admin
+  //      instead of 404. Pre-fix the cwd-relative path was the ONLY
+  //      resolution path, and every fresh install of the compiled binary
+  //      hit 404 on /admin (issue #1090).
   const path = await import('path');
   const fs = await import('fs');
   const adminDistPath = path.join(process.cwd(), 'admin', 'dist');
-  if (fs.existsSync(adminDistPath)) {
+  const useDevPath = fs.existsSync(adminDistPath);
+  if (useDevPath) {
     app.use('/admin', express.static(adminDistPath));
-    // SPA fallback: serve index.html for all unmatched /admin/* routes
     app.get('/admin/{*path}', (req: Request, res: Response, next: NextFunction) => {
-      // Skip API and events routes
       if (req.path.startsWith('/admin/api/') || req.path === '/admin/events' || req.path === '/admin/login') {
         return next();
       }
       res.sendFile(path.join(adminDistPath, 'index.html'));
+    });
+  } else {
+    // Embedded path. Read assets from the generated manifest. Cache the
+    // bytes per asset on first request — these never change for a given
+    // binary, so subsequent requests skip the fs read.
+    const { ADMIN_ASSETS, ADMIN_INDEX_HTML } = await import('../admin-embedded.ts');
+    const cache = new Map<string, Buffer>();
+    function loadAsset(asset: { path: string }): Buffer {
+      const hit = cache.get(asset.path);
+      if (hit) return hit;
+      const buf = fs.readFileSync(asset.path);
+      cache.set(asset.path, buf);
+      return buf;
+    }
+    app.get('/admin/{*path}', (req: Request, res: Response, next: NextFunction) => {
+      if (req.path.startsWith('/admin/api/') || req.path === '/admin/events' || req.path === '/admin/login') {
+        return next();
+      }
+      const hit = ADMIN_ASSETS[req.path];
+      if (hit) {
+        res.setHeader('Content-Type', hit.mime);
+        res.send(loadAsset(hit));
+        return;
+      }
+      // SPA fallback — every unmatched /admin/* route resolves to index.html
+      // so client-side routing takes over (login, dashboard, agents, ...).
+      if (ADMIN_INDEX_HTML) {
+        res.setHeader('Content-Type', ADMIN_INDEX_HTML.mime);
+        res.send(loadAsset(ADMIN_INDEX_HTML));
+        return;
+      }
+      res.status(404).send('admin SPA not available');
     });
   }
 
@@ -743,6 +1052,17 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // MCP tool calls (bearer auth + scope enforcement)
   // ---------------------------------------------------------------------------
   const mcpOperations = operations.filter(op => !op.localOnly);
+
+  // v0.36.x #1076: MCP Streamable HTTP spec — GET /mcp opens an optional SSE
+  // backchannel for server-initiated messages. gbrain's transport is stateless
+  // and doesn't push server-initiated messages, so per spec we MUST return 405
+  // (not 404) so probing clients (claude.ai, etc.) recognize this as an MCP
+  // endpoint, not a missing route. Without this, clients display "endpoint not
+  // found" instead of "endpoint exists but no SSE channel."
+  app.get('/mcp', (_req: Request, res: Response) => {
+    res.set('Allow', 'POST, DELETE');
+    res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
+  });
 
   app.post('/mcp', requireBearerAuth({ verifier: oauthProvider }), async (req: Request, res: Response) => {
     const startTime = Date.now();
@@ -767,8 +1087,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // asserting >= 2 rows after tools/list + tools/call was unreachable.
       const latency = Date.now() - startTime;
       try {
-        await sql`INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-                  VALUES (${authInfo.clientId}, ${agentName}, ${'tools/list'}, ${latency}, ${'success'}, ${null})`;
+        await executeRawJsonb(
+          engine,
+          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+          [authInfo.clientId, agentName, 'tools/list', latency, 'success'],
+          [null],
+        );
       } catch { /* best effort */ }
       broadcastEvent({
         agent: agentName,
@@ -785,12 +1110,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           inputSchema: {
             type: 'object' as const,
             properties: Object.fromEntries(
-              Object.entries(op.params).map(([k, v]) => [k, {
-                type: v.type,
-                description: v.description,
-                ...(v.enum ? { enum: v.enum } : {}),
-                ...(v.default !== undefined ? { default: v.default } : {}),
-              }]),
+              Object.entries(op.params).map(([k, v]) => [k, paramDefToSchema(v)]),
             ),
             required: Object.entries(op.params).filter(([, v]) => v.required).map(([k]) => k),
           },
@@ -807,8 +1127,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // valid-op success/error.
         const latency = Date.now() - startTime;
         try {
-          await sql`INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params, error_message)
-                    VALUES (${authInfo.clientId}, ${agentName}, ${name}, ${latency}, ${'error'}, ${null}, ${`unknown_operation: ${name}`})`;
+          await executeRawJsonb(
+            engine,
+            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+            [authInfo.clientId, agentName, name, latency, 'error', `unknown_operation: ${name}`],
+            [null],
+          );
         } catch { /* best effort */ }
         broadcastEvent({
           agent: agentName,
@@ -834,8 +1159,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // persistence regression test reliable across both rejection paths.
         const latency = Date.now() - startTime;
         try {
-          await sql`INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params, error_message)
-                    VALUES (${authInfo.clientId}, ${agentName}, ${name}, ${latency}, ${'error'}, ${null}, ${`insufficient_scope: requires '${requiredScope}'`})`;
+          await executeRawJsonb(
+            engine,
+            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+            [authInfo.clientId, agentName, name, latency, 'error', `insufficient_scope: requires '${requiredScope}'`],
+            [null],
+          );
         } catch { /* best effort */ }
         broadcastEvent({
           agent: agentName,
@@ -859,79 +1189,80 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         };
       }
 
-      const ctx: OperationContext = {
-        engine,
-        config,
-        logger: {
-          info: (msg: string) => console.error(`[INFO] ${msg}`),
-          warn: (msg: string) => console.error(`[WARN] ${msg}`),
-          error: (msg: string) => console.error(`[ERROR] ${msg}`),
-        },
-        dryRun: !!(params?.dry_run),
-        // F7: HTTP MCP is the untrusted/agent-facing transport. Stdio MCP at
-        // src/mcp/dispatch.ts:61 sets this; the inlined HTTP context-builder
-        // forgot it for several releases, which let HTTP MCP callers with a
-        // read+write token submit `shell` jobs and execute arbitrary commands
-        // on the host (RCE). The fail-closed contract in operations.ts is the
-        // belt; this is the suspenders.
-        remote: true,
-        auth: authInfo,
-      };
-
       // F8: redact request payload by default (declared keys only via the
       // op's `params` allow-list; values + attacker-controlled key names
       // never written to mcp_request_log or the SSE feed). --log-full-params
       // bypasses this for operators debugging on their own laptop, with the
       // startup warning printed earlier.
+      //
+      // D1 (v0.31 wave): mcp_request_log.params is JSONB. Pre-v0.31 wrote
+      // a JSON-string into that JSONB column via the postgres.js template
+      // tag's loose typing — readable but semantically wrong (params->>'op'
+      // would return the encoded string, not the value). Post-v0.31 we
+      // pass the OBJECT through executeRawJsonb with an explicit ::jsonb
+      // cast, so reads return real objects and `params->>'op'` returns
+      // 'tools/list'. Pre-existing string-shaped rows are normalized by
+      // migration v41 in src/core/migrate.ts.
       const safeParamsSummary = summarizeMcpParams(name, params);
-      const logParams = logFullParams
-        ? (params ? JSON.stringify(params) : null)
-        : (safeParamsSummary ? JSON.stringify(safeParamsSummary) : null);
+      const logParamsObj: unknown = logFullParams
+        ? (params || null)
+        : (safeParamsSummary || null);
       const broadcastParams = logFullParams ? (params || {}) : safeParamsSummary;
 
+      // v0.31 (D12 / eE1): refactor the inlined op.handler call to go through
+      // src/mcp/dispatch.ts so HTTP MCP shares the same dispatch path as
+      // stdio MCP. The dispatcher does param validation, OperationContext
+      // build, error envelope unification, and (new) `_meta.brain_hot_memory`
+      // injection via the metaHook. HTTP-specific concerns (mcp_request_log
+      // persistence + SSE broadcast) stay here; the dispatcher returns the
+      // ToolResult and we read isError + _meta to pick the right branch.
+      const tokenAllowList = (authInfo as AuthInfo & { takesHoldersAllowList?: string[] }).takesHoldersAllowList
+        ?? ['world'];
+      // v0.34.1 (#861, D13): AuthInfo.sourceId is now a real typed field
+      // populated from oauth_clients.source_id (migration v60 backfilled
+      // NULL → 'default'). Pre-fix this site cast through AuthInfo and
+      // fell back to GBRAIN_SOURCE env / 'default' — the silent-fallback
+      // path codex flagged in plan review. Post-v60, every OAuth client
+      // has source_id set; legacy bearer tokens default to 'default' in
+      // verifyAccessToken. The env-fallback is gone.
+      const tokenSourceId = authInfo.sourceId ?? 'default';
+
+      let toolResult: Awaited<ReturnType<typeof dispatchToolCall>>;
       try {
-        const result = await op.handler(ctx, (params || {}) as Record<string, unknown>);
-        const latency = Date.now() - startTime;
-
-        try {
-          await sql`INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-                    VALUES (${authInfo.clientId}, ${agentName}, ${name}, ${latency}, ${'success'}, ${logParams})`;
-        } catch { /* best effort */ }
-
-        broadcastEvent({
-          agent: agentName,
-          operation: name,
-          params: broadcastParams,
-          scopes: authInfo.scopes.join(','),
-          latency_ms: latency,
-          status: 'success',
-          timestamp: new Date().toISOString(),
+        toolResult = await dispatchToolCall(engine, name, params as Record<string, unknown> | undefined, {
+          remote: true,
+          takesHoldersAllowList: tokenAllowList,
+          sourceId: tokenSourceId,
+          metaHook: getBrainHotMemoryMeta,
+          // v0.31 follow-up fix: thread auth so the whoami op (and any
+          // future scope-aware handlers) can introspect the caller. The
+          // original D12/eE1 refactor moved dispatch into dispatchToolCall
+          // but forgot to pass authInfo; whoami fell through to the
+          // unknown_transport throw because ctx.auth was undefined.
+          auth: authInfo,
+          logger: {
+            info: (msg: string) => console.error(`[INFO] ${msg}`),
+            warn: (msg: string) => console.error(`[WARN] ${msg}`),
+            error: (msg: string) => console.error(`[ERROR] ${msg}`),
+          },
         });
-
-        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       } catch (e) {
+        // dispatchToolCall absorbs OperationError + Error and returns
+        // isError:true; only an unexpected throw lands here. Treat as the
+        // F15 unified envelope. v0.31 wave (D1): mcp_request_log.params is
+        // JSONB — write the object via executeRawJsonb so reads return a
+        // real object, not a JSON-encoded string.
         const latency = Date.now() - startTime;
-        // F15: unify error envelope. Both OperationError and unexpected
-        // exceptions go through src/core/errors.ts so clients see a single
-        // shape ({class, code, message, hint}). Pre-fix, OperationError
-        // serialized via e.toJSON() and other exceptions used a hand-rolled
-        // {error, message} envelope — a client couldn't pattern-match
-        // reliably across the two.
-        const errorPayload = e instanceof OperationError
-          ? buildError({
-              class: 'OperationError',
-              code: e.code,
-              message: e.message,
-              hint: e.suggestion,
-              docs_url: e.docs,
-            })
-          : serializeError(e);
-        const errMsg = errorPayload.message;
+        const errorPayload = serializeError(e);
         try {
-          await sql`INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params, error_message)
-                    VALUES (${authInfo.clientId}, ${agentName}, ${name}, ${latency}, ${'error'}, ${logParams}, ${errMsg})`;
+          await executeRawJsonb(
+            engine,
+            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+            [authInfo.clientId, agentName, name, latency, 'error', errorPayload.message],
+            [logParamsObj],
+          );
         } catch { /* best effort */ }
-
         broadcastEvent({
           agent: agentName,
           operation: name,
@@ -942,9 +1273,60 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           error: errorPayload,
           timestamp: new Date().toISOString(),
         });
-
         return { content: [{ type: 'text', text: JSON.stringify({ error: errorPayload }) }], isError: true };
       }
+
+      const latency = Date.now() - startTime;
+      if (toolResult.isError) {
+        // dispatchToolCall serializes the error into the content text;
+        // for the audit log we re-extract a message string for the
+        // mcp_request_log error_message column. Best-effort parse.
+        let errMsg = 'unknown_error';
+        try {
+          const parsed = JSON.parse(toolResult.content[0]?.text ?? '{}');
+          errMsg = parsed.error?.message ?? parsed.message ?? errMsg;
+        } catch { /* ignore */ }
+        try {
+          await executeRawJsonb(
+            engine,
+            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+            [authInfo.clientId, agentName, name, latency, 'error', errMsg],
+            [logParamsObj],
+          );
+        } catch { /* best effort */ }
+        broadcastEvent({
+          agent: agentName,
+          operation: name,
+          params: broadcastParams,
+          scopes: authInfo.scopes.join(','),
+          latency_ms: latency,
+          status: 'error',
+          error: { code: 'op_error', message: errMsg },
+          timestamp: new Date().toISOString(),
+        });
+        return toolResult;
+      }
+
+      try {
+        await executeRawJsonb(
+          engine,
+          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+          [authInfo.clientId, agentName, name, latency, 'success'],
+          [logParamsObj],
+        );
+      } catch { /* best effort */ }
+      broadcastEvent({
+        agent: agentName,
+        operation: name,
+        params: broadcastParams,
+        scopes: authInfo.scopes.join(','),
+        latency_ms: latency,
+        status: 'success',
+        timestamp: new Date().toISOString(),
+      });
+      return toolResult;
     });
 
     // F14: wrap transport setup + handleRequest in try/catch. Without this,
@@ -973,12 +1355,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   const clientCount = await sql`SELECT count(*)::int as count FROM oauth_clients`;
 
-  app.listen(port, () => {
+  app.listen(port, bind, () => {
     console.error(`
 ╔══════════════════════════════════════════════════════╗
 ║  GBrain MCP Server v${VERSION.padEnd(37)}║
 ╠══════════════════════════════════════════════════════╣
 ║  Port:      ${String(port).padEnd(40)}║
+║  Bind:      ${bind.padEnd(40)}║
 ║  Engine:    ${(config.engine || 'pglite').padEnd(40)}║
 ║  Issuer:    ${issuerUrl.origin.padEnd(40)}║
 ║  Clients:   ${String((clientCount[0] as any).count).padEnd(40)}║
@@ -989,10 +1372,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 ║  MCP:       http://localhost:${port}/mcp${' '.repeat(Math.max(0, 21 - String(port).length))}║
 ║  Health:    http://localhost:${port}/health${' '.repeat(Math.max(0, 18 - String(port).length))}║
 ╠══════════════════════════════════════════════════════╣
-║  Admin Token (paste into /admin login):              ║
-║  ${bootstrapToken.substring(0, 50)}  ║
-║  ${bootstrapToken.substring(50).padEnd(50)}  ║
-╚══════════════════════════════════════════════════════╝
+${suppressBootstrapPrint
+  ? '║  Admin Token: suppressed (--suppress-bootstrap-token) ║\n╚══════════════════════════════════════════════════════╝'
+  : bootstrapFromEnv
+    ? '║  Admin Token: from $GBRAIN_ADMIN_BOOTSTRAP_TOKEN     ║\n╚══════════════════════════════════════════════════════╝'
+    : `║  Admin Token (paste into /admin login):              ║\n║  ${bootstrapToken.substring(0, 50)}  ║\n║  ${bootstrapToken.substring(50).padEnd(50)}  ║\n╚══════════════════════════════════════════════════════╝`}
 `);
   });
 }
